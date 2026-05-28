@@ -155,23 +155,9 @@ def compute_state_diff(before: dict[str, Any], after: dict[str, Any], limit: int
     }
 
 
-def draw_annotations(image_path: str | Path, out_path: str | Path, nodes: list[dict[str, Any]], limit: int = 80) -> dict[str, Any]:
-    try:
-        from PIL import Image, ImageDraw, ImageFont
-    except ImportError as exc:
-        return draw_svg_annotations(image_path, out_path, nodes, limit)
-
-    image = Image.open(image_path).convert("RGBA")
-    draw = ImageDraw.Draw(image)
-    try:
-        font = ImageFont.truetype("DejaVuSans.ttf", 12)
-    except Exception:
-        font = ImageFont.load_default()
-
-    drawn = 0
+def target_nodes(nodes: list[dict[str, Any]], limit: int = 80) -> list[dict[str, Any]]:
+    targets = []
     for node in nodes:
-        if drawn >= limit:
-            break
         frame = node.get("frame")
         if not isinstance(frame, dict):
             continue
@@ -186,8 +172,51 @@ def draw_annotations(image_path: str | Path, out_path: str | Path, nodes: list[d
             continue
         label = str(node.get("id") or "")
         role = str(node.get("role") or "").replace("AX", "")
+        title = str(node.get("title") or "")
+        description = str(node.get("description") or "")
+        value = str(node.get("value") or "")
         if role:
             label = f"{label}:{role}"
+        targets.append(
+            {
+                "id": node.get("id"),
+                "label": label,
+                "role": node.get("role"),
+                "title": title[:120],
+                "description": description[:120],
+                "value": value[:120],
+                "frame": {"x": x, "y": y, "width": w, "height": h},
+                "center": {"x": x + w / 2, "y": y + h / 2},
+            }
+        )
+        if len(targets) >= limit:
+            break
+    return targets
+
+
+def draw_annotations(image_path: str | Path, out_path: str | Path, nodes: list[dict[str, Any]], limit: int = 80) -> dict[str, Any]:
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError as exc:
+        return draw_svg_annotations(image_path, out_path, nodes, limit)
+
+    image = Image.open(image_path).convert("RGBA")
+    draw = ImageDraw.Draw(image)
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", 12)
+    except Exception:
+        font = ImageFont.load_default()
+
+    drawn = 0
+    for target in target_nodes(nodes, limit):
+        if drawn >= limit:
+            break
+        frame = target["frame"]
+        x = frame["x"]
+        y = frame["y"]
+        w = frame["width"]
+        h = frame["height"]
+        label = str(target["label"])
         draw.rectangle((x, y, x + w, y + h), outline=(255, 60, 60, 230), width=2)
         text_box = draw.textbbox((x, y), label, font=font)
         pad = 2
@@ -210,25 +239,15 @@ def draw_svg_annotations(image_path: str | Path, out_path: str | Path, nodes: li
     boxes = []
     max_x = 1.0
     max_y = 1.0
-    for node in nodes:
+    for target in target_nodes(nodes, limit):
         if len(boxes) >= limit:
             break
-        frame = node.get("frame")
-        if not isinstance(frame, dict):
-            continue
-        try:
-            x = float(frame["x"])
-            y = float(frame["y"])
-            w = float(frame["width"])
-            h = float(frame["height"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        if w <= 3 or h <= 3:
-            continue
-        label = str(node.get("id") or "")
-        role = str(node.get("role") or "").replace("AX", "")
-        if role:
-            label = f"{label}:{role}"
+        frame = target["frame"]
+        x = frame["x"]
+        y = frame["y"]
+        w = frame["width"]
+        h = frame["height"]
+        label = str(target["label"])
         max_x = max(max_x, x + w)
         max_y = max(max_y, y + h)
         boxes.append((x, y, w, h, label))
@@ -450,8 +469,10 @@ def command_annotate_state(args: argparse.Namespace) -> int:
             nodes = nested_nodes
     if args.surface != "mac":
         raise CliError("annotated boxes currently require Mac AX frames; Windows returns screenshot metadata only")
-    annotation = draw_annotations(source_path, args.out, [node for node in nodes if isinstance(node, dict)], args.limit)
-    print_json({"ok": True, "surface": args.surface, "state": payload, "annotation": annotation})
+    clean_nodes = [node for node in nodes if isinstance(node, dict)]
+    targets = target_nodes(clean_nodes, args.limit)
+    annotation = draw_annotations(source_path, args.out, clean_nodes, args.limit)
+    print_json({"ok": True, "surface": args.surface, "state": payload, "annotation": annotation, "targets": targets})
     return 0
 
 

@@ -8,7 +8,7 @@
 [![Platform: macOS](https://img.shields.io/badge/platform-macOS-black.svg)](#surfaces)
 [![Platform: Windows](https://img.shields.io/badge/platform-Windows-0078D4.svg)](#surfaces)
 [![MCP](https://img.shields.io/badge/MCP-tools-blue.svg)](#mcp-tools)
-[![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#status)
+[![Status: usable](https://img.shields.io/badge/status-usable-brightgreen.svg)](#status)
 
 Give desktop agents eyes, hands, and a record of what changed.
 
@@ -85,7 +85,7 @@ Both surfaces are exposed through the scripts in this repository:
 - **State-first capture**: screenshot metadata plus a semantic tree where available.
 - **Bounded context output**: Windows snapshots and find results are capped by default to avoid context overflow.
 - **Semantic targeting**: prefer ids from the latest capture, queries, roles, labels, and UI tree matches before raw coordinates.
-- **Visual grounding**: `annotate-state` draws wrapper-generated Accessibility ids and roles onto screenshots on macOS, with SVG fallback when Pillow is unavailable.
+- **Visual grounding**: `annotate-state` draws wrapper-generated Accessibility ids and roles onto screenshots on macOS, returns click centers, and falls back to SVG when Pillow is unavailable.
 - **State diffing**: save state snapshots and compare later captures as compact added/removed line deltas.
 - **Action repair loop**: `act` captures before/after state, verifies expected UI text, and retries within a small bound.
 - **Workflow replay**: JSON workflows replay through `act`, so every step still gets diff, verification, and retry.
@@ -369,7 +369,7 @@ Run the cross-surface eval suite after any control behavior change:
 scripts/eval-computer-state
 ```
 
-It verifies:
+It writes both `report.json` and `report.md`, and verifies:
 
 - Python syntax
 - MCP `tools/list`
@@ -408,7 +408,7 @@ Use semantic targets and `get-state`/`act` verification before GUI actions. Use 
 
 ## Status
 
-Alpha, but operational.
+Usable and fairly complete for its intended scope.
 
 Verified on the author's local Mac/Windows setup:
 

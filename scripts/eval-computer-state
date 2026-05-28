@@ -86,7 +86,27 @@ def main() -> int:
             for item in cases
         ],
     }
+    passed = sum(1 for item in summary["cases"] if item["ok"])
+    summary["passed"] = passed
+    summary["failed"] = len(summary["cases"]) - passed
+    summary["totalDurationMs"] = sum(item["durationMs"] for item in summary["cases"])
+    markdown_lines = [
+        "# OpenClaw Computer State Eval",
+        "",
+        f"- Status: {'PASS' if summary['ok'] else 'FAIL'}",
+        f"- Cases: {passed}/{len(summary['cases'])} passed",
+        f"- Total duration: {summary['totalDurationMs']} ms",
+        "",
+        "| Case | Status | Duration | Return Code |",
+        "|---|---:|---:|---:|",
+    ]
+    for item in summary["cases"]:
+        markdown_lines.append(
+            f"| {item['name']} | {'PASS' if item['ok'] else 'FAIL'} | {item['durationMs']} ms | {item['returncode']} |"
+        )
     (RUN_DIR / "report.json").write_text(json.dumps({"summary": summary, "cases": cases}, ensure_ascii=False, indent=2), encoding="utf-8")
+    (RUN_DIR / "report.md").write_text("\n".join(markdown_lines) + "\n", encoding="utf-8")
+    summary["reportMarkdown"] = str(RUN_DIR / "report.md")
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0 if summary["ok"] else 1
 
