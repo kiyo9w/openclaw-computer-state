@@ -10,7 +10,7 @@
 [![MCP](https://img.shields.io/badge/MCP-tools-blue.svg)](#mcp-tools)
 [![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#status)
 
-Give an agent a real UI state, let it act, then verify what changed.
+Give desktop agents eyes, hands, and a record of what changed.
 
 </div>
 
