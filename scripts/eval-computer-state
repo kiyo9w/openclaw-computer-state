@@ -54,7 +54,8 @@ def case(name: str, cmd: list[str], timeout: int = 60, stdin: str | None = None)
 def main() -> int:
     RUN_DIR.mkdir(parents=True, exist_ok=True)
     before = RUN_DIR / "win-before.json"
-    annotated = RUN_DIR / "mac-annotated.png"
+    mac_annotated = RUN_DIR / "mac-annotated.png"
+    win_annotated = RUN_DIR / "win-annotated.png"
     workflow = ROOT / "examples" / "workflows" / "win-esc-smoke.json"
     workflow_report = RUN_DIR / "workflow-report.json"
     mcp_input = '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}\n'
@@ -70,7 +71,8 @@ def main() -> int:
         case("workflow validate", [str(COMPUTER_WORKFLOW), "validate", "--file", str(workflow)], timeout=30),
         case("workflow dry-run", [str(COMPUTER_WORKFLOW), "replay", "--file", str(workflow), "--dry-run"], timeout=30),
         case("workflow replay", [str(COMPUTER_WORKFLOW), "replay", "--file", str(workflow), "--report", str(workflow_report)], timeout=90),
-        case("mac annotated state", [str(COMPUTER_STATE), "annotate-state", "--surface", "mac", "--max-depth", "2", "--max-nodes", "50", "--out", str(annotated)], timeout=60),
+        case("mac annotated state", [str(COMPUTER_STATE), "annotate-state", "--surface", "mac", "--max-depth", "2", "--max-nodes", "50", "--out", str(mac_annotated)], timeout=60),
+        case("win annotated state", [str(COMPUTER_STATE), "annotate-state", "--surface", "win", "--limit", "50", "--out", str(win_annotated)], timeout=60),
     ]
     summary = {
         "ok": all(item["ok"] for item in cases),

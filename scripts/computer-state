@@ -78,6 +78,14 @@ def windows_global_args(args: argparse.Namespace) -> list[str]:
 
 
 def normalize_win_snapshot_text(text: str) -> str:
+    try:
+        decoded = json.loads(text)
+        if isinstance(decoded, list):
+            text = "\n".join(str(item) for item in decoded)
+        elif isinstance(decoded, str):
+            text = decoded
+    except json.JSONDecodeError:
+        pass
     replacements = {
         "âââ": "├──",
         "âââ": "└──",
@@ -194,6 +202,46 @@ def target_nodes(nodes: list[dict[str, Any]], limit: int = 80) -> list[dict[str,
     return targets
 
 
+WIN_TARGET_RE = re.compile(
+    r'\((?P<x>\d+),(?P<y>\d+)\)\s+(?P<role>[a-zA-Z ]+?)\s+"(?P<title>.*?)"(?:\s{2,}|\s+\[|$)'
+)
+
+
+def windows_target_nodes(snapshot_text: str, limit: int = 80, marker_size: int = 28) -> list[dict[str, Any]]:
+    targets: list[dict[str, Any]] = []
+    half = max(marker_size, 8) / 2
+    seen: set[tuple[int, int, str, str]] = set()
+    for line in snapshot_text.splitlines():
+        match = WIN_TARGET_RE.search(line)
+        if not match:
+            continue
+        x = int(match.group("x"))
+        y = int(match.group("y"))
+        role = " ".join(match.group("role").split())
+        title = match.group("title")
+        key = (x, y, role, title)
+        if key in seen:
+            continue
+        seen.add(key)
+        target_id = len(targets) + 1
+        targets.append(
+            {
+                "id": target_id,
+                "label": str(target_id),
+                "role": role,
+                "title": title[:160],
+                "description": line.strip()[:240],
+                "value": "",
+                "frame": {"x": x - half, "y": y - half, "width": half * 2, "height": half * 2},
+                "center": {"x": x, "y": y},
+                "source": "windows-mcp-snapshot",
+            }
+        )
+        if len(targets) >= limit:
+            break
+    return targets
+
+
 def draw_annotations(image_path: str | Path, out_path: str | Path, nodes: list[dict[str, Any]], limit: int = 80) -> dict[str, Any]:
     try:
         from PIL import Image, ImageDraw, ImageFont
@@ -235,10 +283,19 @@ def draw_annotations(image_path: str | Path, out_path: str | Path, nodes: list[d
 
 def draw_svg_annotations(image_path: str | Path, out_path: str | Path, nodes: list[dict[str, Any]], limit: int = 80) -> dict[str, Any]:
     import html
+    import struct
 
     boxes = []
     max_x = 1.0
     max_y = 1.0
+    try:
+        with Path(image_path).open("rb") as f:
+            header = f.read(24)
+        if header.startswith(b"\x89PNG\r\n\x1a\n"):
+            max_x = float(struct.unpack(">I", header[16:20])[0])
+            max_y = float(struct.unpack(">I", header[20:24])[0])
+    except OSError:
+        pass
     for target in target_nodes(nodes, limit):
         if len(boxes) >= limit:
             break
@@ -462,13 +519,18 @@ def command_annotate_state(args: argparse.Namespace) -> int:
         source_path = payload.get("path")
     if not source_path:
         raise CliError("state capture did not include a local screenshot path")
+    if args.surface == "win":
+        clean_nodes = windows_target_nodes(str(payload.get("snapshotText") or ""), args.limit)
+        targets = target_nodes(clean_nodes, args.limit)
+        annotation = draw_annotations(source_path, args.out, clean_nodes, args.limit)
+        print_json({"ok": True, "surface": args.surface, "state": payload, "annotation": annotation, "targets": targets})
+        return 0
+
     nodes = payload.get("nodes") if isinstance(payload.get("nodes"), list) else []
     if not nodes and isinstance(payload.get("accessibility"), dict):
         nested_nodes = payload["accessibility"].get("nodes")
         if isinstance(nested_nodes, list):
             nodes = nested_nodes
-    if args.surface != "mac":
-        raise CliError("annotated boxes currently require Mac AX frames; Windows returns screenshot metadata only")
     clean_nodes = [node for node in nodes if isinstance(node, dict)]
     targets = target_nodes(clean_nodes, args.limit)
     annotation = draw_annotations(source_path, args.out, clean_nodes, args.limit)

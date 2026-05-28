@@ -40,13 +40,14 @@ scripts/computer-state get-state --surface win --max-chars 12000 --save-state /t
 scripts/computer-state get-state --surface win --max-chars 12000 --diff-from /tmp/before.json --diff-limit 20
 ```
 
-For visual grounding on macOS, generate an annotated screenshot with Accessibility ids and roles:
+For visual grounding, generate an annotated screenshot with current target ids and roles:
 
 ```bash
 scripts/computer-state annotate-state --surface mac --app "ChatGPT Atlas" --out /tmp/chatgpt-annotated.png
+scripts/computer-state annotate-state --surface win --limit 80 --out /tmp/windows-annotated.png
 ```
 
-If Pillow is unavailable, `annotate-state` writes an SVG overlay next to the requested PNG path. Install Pillow only if PNG output is required.
+macOS uses Accessibility frames. Windows uses UIA snapshot coordinates from `windows-mcp` and marks each clickable/fillable center. If Pillow is unavailable, `annotate-state` writes an SVG overlay next to the requested PNG path. Install Pillow only if PNG output is required.
 
 Then act using semantic targets whenever possible:
 
@@ -172,7 +173,7 @@ Run the cross-surface eval suite when changing control behavior:
 scripts/eval-computer-state
 ```
 
-The eval writes a JSON report under `.control-runs/evals/` with per-case latency and pass/fail status.
+The eval writes `report.json` and `report.md` under `.control-runs/evals/` with per-case latency and pass/fail status.
 
 ## Verification
 

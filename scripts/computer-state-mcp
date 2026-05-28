@@ -103,7 +103,7 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "computer_annotate_state",
-        "description": "Capture a screenshot and draw Mac Accessibility element boxes/ids on top for visual grounding.",
+        "description": "Capture a screenshot and draw target ids on top for visual grounding. Uses Mac Accessibility frames on macOS and Windows MCP snapshot coordinates on Windows.",
         "inputSchema": schema_object(
             {
                 "surface": SURFACE,
