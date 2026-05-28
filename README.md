@@ -18,7 +18,7 @@ Give an agent a real UI state, let it act, then verify what changed.
 
 ## TL;DR
 
-OpenClaw Computer State packages the desktop-control layer used by OpenClaw to inspect and operate real machines through one MCP vocabulary.
+OpenClaw Computer State is a standalone desktop-control toolkit for OpenClaw-style agents that need to inspect and operate real macOS and Windows machines through one MCP vocabulary.
 
 It combines:
 
@@ -46,7 +46,7 @@ scripts/eval-computer-state
 
 Desktop agents fail when they click blind.
 
-OpenClaw already had strong primitives for controlling macOS and Windows, but they lived behind separate commands and mental models:
+This project started as a set of local bridge scripts for controlling macOS and Windows from an OpenClaw workspace. The primitives worked, but they lived behind separate commands and mental models:
 
 - `scripts/maccontrol`
 - `scripts/maccomputer`
@@ -72,7 +72,7 @@ The goal is not to be a giant computer-use framework. The goal is a small, inspe
 | `mac` | `scripts/maccomputer` -> `MacControl.app` on `macbox` | screenshot + macOS Accessibility tree | AX press/set/select, mouse, keyboard, AppleScript, app/window helpers |
 | `win` | `scripts/windows-mcp-call` + `scripts/wincontrol` | Windows-MCP semantic snapshot + optional screenshot | label/coordinate click, type, shortcuts, scroll, drag, app/window helpers |
 
-Both surfaces are exposed through:
+Both surfaces are exposed through the scripts in this repository:
 
 - CLI: `scripts/computer-state`
 - MCP stdio server: `scripts/computer-state-mcp`
@@ -410,7 +410,7 @@ Use semantic targets and `get-state`/`act` verification before GUI actions. Use 
 
 Alpha, but operational.
 
-Verified on the local OpenClaw Mac/Windows setup:
+Verified on the author's local Mac/Windows setup:
 
 - macOS Accessibility and screenshot capture through `MacControl.app`
 - Windows MCP snapshots through `windows-mcp`
@@ -419,7 +419,7 @@ Verified on the local OpenClaw Mac/Windows setup:
 - workflow replay
 - cross-surface eval suite
 
-This is not a hosted computer-use product. It is a local control layer for OpenClaw deployments that already have the Mac/Windows bridge configured.
+This is not a hosted computer-use product and it is not a native OpenClaw runtime feature. It is a local control layer made of repo-managed scripts and helper binaries for deployments that already have the Mac/Windows bridge configured.
 
 ---
 
