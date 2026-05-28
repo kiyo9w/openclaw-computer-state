@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+HOST="${MACCONTROL_HOST:-macbox}"
+PORT="${MACCONTROL_PORT:-17891}"
+
+if [[ "${1:-}" == "--host" ]]; then
+  HOST="$2"
+  shift 2
+fi
+
+if [[ $# -eq 0 ]]; then
+  echo "usage: scripts/maccontrol [--host macbox] <screenshot|click|type|hotkey|clipboard> ..." >&2
+  exit 2
+fi
+
+ARGV_JSON="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1:]))' "$@")"
+
+exec ssh -o BatchMode=yes -o ConnectTimeout=8 "$HOST" /usr/bin/python3 /Users/ngotrung/OpenClawTools/MacControl/maccontrol-client.py "$PORT" <<<"$ARGV_JSON"

@@ -1,0 +1,624 @@
+#!/usr/bin/env python3
+import json
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+
+WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
+COMPUTER_STATE = WORKSPACE_ROOT / "scripts" / "computer-state"
+SERVER_NAME = "openclaw-computer-state"
+SERVER_VERSION = "0.1.0"
+USE_CONTENT_LENGTH = False
+
+
+def schema_object(properties: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": required or [],
+        "additionalProperties": False,
+    }
+
+
+SURFACE = {
+    "type": "string",
+    "enum": ["mac", "win"],
+    "default": "mac",
+    "description": "Target desktop surface. mac uses macbox/MacControl; win uses Windows MCP plus wincontrol.",
+}
+
+MAC_TARGET = {
+    "app": {"type": "string", "description": "Mac application name, for example ChatGPT Atlas."},
+    "bundle_id": {"type": "string", "description": "Mac bundle identifier."},
+    "pid": {"type": "integer", "description": "Mac process id."},
+}
+
+GLOBAL = {
+    "host": {"type": "string", "default": "macbox", "description": "SSH host for MacControl."},
+    "endpoint": {"type": "string", "description": "Windows MCP endpoint URL."},
+    "ledger_run": {"type": "string", "description": "Optional Windows MCP ledger run id."},
+    "allow_sensitive": {
+        "type": "boolean",
+        "default": False,
+        "description": "Pass through sensitive-action allowance for Windows MCP only when already confirmed.",
+    },
+}
+
+
+TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "computer_surfaces",
+        "description": "List available desktop control surfaces.",
+        "inputSchema": schema_object({}),
+    },
+    {
+        "name": "computer_healthcheck",
+        "description": "Check whether a desktop surface is reachable.",
+        "inputSchema": schema_object({"surface": SURFACE, **GLOBAL}),
+    },
+    {
+        "name": "computer_list_apps",
+        "description": "List visible/running applications for a desktop surface.",
+        "inputSchema": schema_object({"surface": SURFACE, "limit": {"type": "integer", "default": 50}, **GLOBAL}),
+    },
+    {
+        "name": "computer_app",
+        "description": "Open/focus/quit Mac apps, or launch/switch/resize Windows app windows.",
+        "inputSchema": schema_object(
+            {
+                "surface": SURFACE,
+                "mode": {"type": "string", "enum": ["open", "focus", "quit", "launch", "switch", "resize"]},
+                "name": {"type": "string", "description": "Application or window name."},
+                "bundle_id": {"type": "string", "description": "Mac bundle identifier."},
+                "window_x": {"type": "integer", "description": "Windows resize target x."},
+                "window_y": {"type": "integer", "description": "Windows resize target y."},
+                "window_width": {"type": "integer", "description": "Windows resize target width."},
+                "window_height": {"type": "integer", "description": "Windows resize target height."},
+                **GLOBAL,
+            },
+            ["mode"],
+        ),
+    },
+    {
+        "name": "computer_get_state",
+        "description": "Capture the current UI state. Call this before GUI actions. Returns screenshot metadata and a semantic UI tree where available.",
+        "inputSchema": schema_object(
+            {
+                "surface": SURFACE,
+                **MAC_TARGET,
+                "max_depth": {"type": "integer", "default": 5},
+                "max_nodes": {"type": "integer", "default": 300},
+                "max_chars": {"type": "integer", "default": 20000, "description": "Windows snapshot text character cap; 0 means unlimited."},
+                "copy_screenshot": {"type": "string", "description": "Optional local path for screenshot copy."},
+                "copy_screenshot_default": {"type": "boolean", "default": False},
+                **GLOBAL,
+            }
+        ),
+    },
+    {
+        "name": "computer_find",
+        "description": "Find UI elements by query in the latest/current accessibility or snapshot tree.",
+        "inputSchema": schema_object(
+            {
+                "surface": SURFACE,
+                **MAC_TARGET,
+                "query": {"type": "string"},
+                "role": {"type": "string", "description": "Optional Mac AX role filter, for example Button or MenuBarItem."},
+                "limit": {"type": "integer", "default": 20},
+                "max_match_chars": {"type": "integer", "default": 500, "description": "Windows per-match character cap; 0 means unlimited."},
+                **GLOBAL,
+            },
+            ["query"],
+        ),
+    },
+    {
+        "name": "computer_click",
+        "description": "Click a UI target. Prefer Mac id/query or Windows numeric annotation label over raw coordinates.",
+        "inputSchema": schema_object(
+            {
+                "surface": SURFACE,
+                **MAC_TARGET,
+                "id": {"type": "integer", "description": "Mac AX element id."},
+                "query": {"type": "string", "description": "Mac semantic query."},
+                "role": {"type": "string", "description": "Optional Mac AX role filter."},
+                "label": {"type": "integer", "description": "Windows numeric annotation label."},
+                "x": {"type": "number"},
+                "y": {"type": "number"},
+                "button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"},
+                "clicks": {"type": "integer", "default": 1},
+                **GLOBAL,
+            },
+        ),
+    },
+    {
+        "name": "computer_set_value",
+        "description": "Replace the value of a text-capable UI target. On Mac this uses Accessibility set-value; on Windows it clears then types.",
+        "inputSchema": schema_object(
+            {
+                "surface": SURFACE,
+                **MAC_TARGET,
+                "text": {"type": "string"},
+                "id": {"type": "integer", "description": "Mac AX element id."},
+                "query": {"type": "string", "description": "Mac semantic query."},
+                "role": {"type": "string", "description": "Optional Mac AX role filter."},
+                "label": {"type": "integer", "description": "Windows numeric annotation label."},
+                "x": {"type": "number"},
+                "y": {"type": "number"},
+                "enter": {"type": "boolean", "default": False},
+                **GLOBAL,
+            },
+            ["text"],
+        ),
+    },
+    {
+        "name": "computer_type_into",
+        "description": "Focus a specific UI target, then type text into it. On Mac this clicks the AX element first; on Windows it types into a numeric-label/coordinate target.",
+        "inputSchema": schema_object(
+            {
+                "surface": SURFACE,
+                **MAC_TARGET,
+                "text": {"type": "string"},
+                "id": {"type": "integer", "description": "Mac AX element id."},
+                "query": {"type": "string", "description": "Mac semantic query."},
+                "role": {"type": "string", "description": "Optional Mac AX role filter."},
+                "label": {"type": "integer", "description": "Windows numeric annotation label."},
+                "x": {"type": "number"},
+                "y": {"type": "number"},
+                "clear": {"type": "boolean", "default": False},
+                "enter": {"type": "boolean", "default": False},
+                **GLOBAL,
+            },
+            ["text"],
+        ),
+    },
+    {
+        "name": "computer_perform_action",
+        "description": "Perform a named Mac Accessibility action exposed by an element, for example AXPress or AXShowMenu.",
+        "inputSchema": schema_object(
+            {
+                "surface": SURFACE,
+                **MAC_TARGET,
+                "action": {"type": "string"},
+                "id": {"type": "integer", "description": "Mac AX element id."},
+                "query": {"type": "string", "description": "Mac semantic query."},
+                "role": {"type": "string", "description": "Optional Mac AX role filter."},
+                **GLOBAL,
+            },
+            ["action"],
+        ),
+    },
+    {
+        "name": "computer_select_text",
+        "description": "Select target text inside a Mac Accessibility text element, or place the text cursor before/after it.",
+        "inputSchema": schema_object(
+            {
+                "surface": SURFACE,
+                **MAC_TARGET,
+                "text": {"type": "string"},
+                "id": {"type": "integer", "description": "Mac AX element id."},
+                "query": {"type": "string", "description": "Mac semantic query."},
+                "role": {"type": "string", "description": "Optional Mac AX role filter."},
+                "prefix": {"type": "string", "description": "Optional exact text immediately before the target text."},
+                "suffix": {"type": "string", "description": "Optional exact text immediately after the target text."},
+                "mode": {"type": "string", "enum": ["select", "before", "after"], "default": "select"},
+                **GLOBAL,
+            },
+            ["text"],
+        ),
+    },
+    {
+        "name": "computer_run_applescript",
+        "description": "Run AppleScript through the persistent MacControl app. Use explicit user approval for risky scripts that change settings, send messages, delete data, or transmit sensitive data.",
+        "inputSchema": schema_object(
+            {
+                "surface": SURFACE,
+                "script": {"type": "string"},
+                "timeout": {"type": "integer", "default": 20},
+                **GLOBAL,
+            },
+            ["script"],
+        ),
+    },
+    {
+        "name": "computer_type_text",
+        "description": "Type text into the active target or a Windows numeric-label/coordinate target.",
+        "inputSchema": schema_object(
+            {
+                "surface": SURFACE,
+                "text": {"type": "string"},
+                "label": {"type": "integer", "description": "Windows numeric annotation label."},
+                "x": {"type": "number"},
+                "y": {"type": "number"},
+                "clear": {"type": "boolean", "default": False},
+                "enter": {"type": "boolean", "default": False},
+                **GLOBAL,
+            },
+            ["text"],
+        ),
+    },
+    {
+        "name": "computer_press_key",
+        "description": "Press a key or key chord on the target surface.",
+        "inputSchema": schema_object(
+            {
+                "surface": SURFACE,
+                "key": {"type": "string", "description": "Key or chord, using the backend's native syntax."},
+                **GLOBAL,
+            },
+            ["key"],
+        ),
+    },
+    {
+        "name": "computer_scroll",
+        "description": "Scroll by pixel deltas. Currently implemented for Mac.",
+        "inputSchema": schema_object(
+            {
+                "surface": SURFACE,
+                "dx": {"type": "integer", "default": 0},
+                "dy": {"type": "integer", "default": 0},
+                "x": {"type": "number", "description": "Optional Windows cursor x position before scrolling."},
+                "y": {"type": "number", "description": "Optional Windows cursor y position before scrolling."},
+                **GLOBAL,
+            },
+        ),
+    },
+    {
+        "name": "computer_drag",
+        "description": "Drag from one screenshot coordinate to another. Currently implemented for Mac.",
+        "inputSchema": schema_object(
+            {
+                "surface": SURFACE,
+                "x1": {"type": "number"},
+                "y1": {"type": "number"},
+                "x2": {"type": "number"},
+                "y2": {"type": "number"},
+                **GLOBAL,
+            },
+            ["x1", "y1", "x2", "y2"],
+        ),
+    },
+    {
+        "name": "computer_wait_for",
+        "description": "Poll the UI tree until a query appears, with bounded output.",
+        "inputSchema": schema_object(
+            {
+                "surface": SURFACE,
+                **MAC_TARGET,
+                "query": {"type": "string"},
+                "role": {"type": "string", "description": "Optional Mac AX role filter."},
+                "timeout_ms": {"type": "integer", "default": 10000},
+                "interval_ms": {"type": "integer", "default": 250},
+                **GLOBAL,
+            },
+            ["query"],
+        ),
+    },
+]
+
+
+def response(message_id: Any, result: Any) -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": message_id, "result": result}
+
+
+def error_response(message_id: Any, code: int, message: str, data: Any | None = None) -> dict[str, Any]:
+    payload: dict[str, Any] = {"jsonrpc": "2.0", "id": message_id, "error": {"code": code, "message": message}}
+    if data is not None:
+        payload["error"]["data"] = data
+    return payload
+
+
+def emit(payload: dict[str, Any]) -> None:
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if USE_CONTENT_LENGTH:
+        sys.stdout.buffer.write(f"Content-Length: {len(encoded)}\r\n\r\n".encode("ascii") + encoded)
+        sys.stdout.buffer.flush()
+        return
+    sys.stdout.write(encoded.decode("utf-8") + "\n")
+    sys.stdout.flush()
+
+
+def add_common(cmd: list[str], args: dict[str, Any]) -> None:
+    surface = args.get("surface")
+    if surface:
+        cmd.extend(["--surface", str(surface)])
+    if args.get("host"):
+        cmd.extend(["--host", str(args["host"])])
+    if args.get("endpoint"):
+        cmd.extend(["--endpoint", str(args["endpoint"])])
+    if args.get("ledger_run"):
+        cmd.extend(["--ledger-run", str(args["ledger_run"])])
+    if args.get("allow_sensitive"):
+        cmd.append("--allow-sensitive")
+
+
+def add_mac_target(cmd: list[str], args: dict[str, Any]) -> None:
+    if args.get("app"):
+        cmd.extend(["--app", str(args["app"])])
+    if args.get("bundle_id"):
+        cmd.extend(["--bundle-id", str(args["bundle_id"])])
+    if args.get("pid") is not None:
+        cmd.extend(["--pid", str(args["pid"])])
+
+
+def run_computer_state(command: str, args: dict[str, Any]) -> dict[str, Any]:
+    cmd = [str(COMPUTER_STATE), command]
+    add_common(cmd, args)
+
+    if command == "list-apps":
+        if args.get("limit") is not None:
+            cmd.extend(["--limit", str(args["limit"])])
+    elif command == "app":
+        cmd.append(str(args["mode"]))
+        if args.get("name"):
+            cmd.extend(["--name", str(args["name"])])
+        if args.get("bundle_id"):
+            cmd.extend(["--bundle-id", str(args["bundle_id"])])
+        if args.get("window_x") is not None:
+            cmd.extend(["--window-x", str(args["window_x"])])
+        if args.get("window_y") is not None:
+            cmd.extend(["--window-y", str(args["window_y"])])
+        if args.get("window_width") is not None:
+            cmd.extend(["--window-width", str(args["window_width"])])
+        if args.get("window_height") is not None:
+            cmd.extend(["--window-height", str(args["window_height"])])
+    elif command == "get-state":
+        add_mac_target(cmd, args)
+        if args.get("max_depth") is not None:
+            cmd.extend(["--max-depth", str(args["max_depth"])])
+        if args.get("max_nodes") is not None:
+            cmd.extend(["--max-nodes", str(args["max_nodes"])])
+        if args.get("max_chars") is not None:
+            cmd.extend(["--max-chars", str(args["max_chars"])])
+        if args.get("copy_screenshot"):
+            cmd.extend(["--copy-screenshot", str(args["copy_screenshot"])])
+        if args.get("copy_screenshot_default"):
+            cmd.append("--copy-screenshot-default")
+    elif command == "find":
+        add_mac_target(cmd, args)
+        cmd.extend(["--query", str(args["query"])])
+        if args.get("role"):
+            cmd.extend(["--role", str(args["role"])])
+        if args.get("limit") is not None:
+            cmd.extend(["--limit", str(args["limit"])])
+        if args.get("max_match_chars") is not None:
+            cmd.extend(["--max-match-chars", str(args["max_match_chars"])])
+    elif command == "click":
+        add_mac_target(cmd, args)
+        if args.get("id") is not None:
+            cmd.extend(["--id", str(args["id"])])
+        if args.get("query"):
+            cmd.extend(["--query", str(args["query"])])
+        if args.get("role"):
+            cmd.extend(["--role", str(args["role"])])
+        if args.get("label"):
+            cmd.extend(["--label", str(args["label"])])
+        if args.get("x") is not None:
+            cmd.extend(["--x", str(args["x"])])
+        if args.get("y") is not None:
+            cmd.extend(["--y", str(args["y"])])
+        if args.get("button"):
+            cmd.extend(["--button", str(args["button"])])
+        if args.get("clicks") is not None:
+            cmd.extend(["--clicks", str(args["clicks"])])
+    elif command == "set-value":
+        add_mac_target(cmd, args)
+        cmd.extend(["--text", str(args["text"])])
+        if args.get("id") is not None:
+            cmd.extend(["--id", str(args["id"])])
+        if args.get("query"):
+            cmd.extend(["--query", str(args["query"])])
+        if args.get("role"):
+            cmd.extend(["--role", str(args["role"])])
+        if args.get("label") is not None:
+            cmd.extend(["--label", str(args["label"])])
+        if args.get("x") is not None:
+            cmd.extend(["--x", str(args["x"])])
+        if args.get("y") is not None:
+            cmd.extend(["--y", str(args["y"])])
+        if args.get("enter"):
+            cmd.append("--enter")
+    elif command in ("type-text", "type-into"):
+        if command == "type-into":
+            add_mac_target(cmd, args)
+        cmd.extend(["--text", str(args["text"])])
+        if args.get("id") is not None:
+            cmd.extend(["--id", str(args["id"])])
+        if args.get("query"):
+            cmd.extend(["--query", str(args["query"])])
+        if args.get("role"):
+            cmd.extend(["--role", str(args["role"])])
+        if args.get("label"):
+            cmd.extend(["--label", str(args["label"])])
+        if args.get("x") is not None:
+            cmd.extend(["--x", str(args["x"])])
+        if args.get("y") is not None:
+            cmd.extend(["--y", str(args["y"])])
+        if args.get("clear"):
+            cmd.append("--clear")
+        if args.get("enter"):
+            cmd.append("--enter")
+    elif command == "perform-action":
+        add_mac_target(cmd, args)
+        cmd.extend(["--action", str(args["action"])])
+        if args.get("id") is not None:
+            cmd.extend(["--id", str(args["id"])])
+        if args.get("query"):
+            cmd.extend(["--query", str(args["query"])])
+        if args.get("role"):
+            cmd.extend(["--role", str(args["role"])])
+    elif command == "select-text":
+        add_mac_target(cmd, args)
+        cmd.extend(["--text", str(args["text"])])
+        if args.get("id") is not None:
+            cmd.extend(["--id", str(args["id"])])
+        if args.get("query"):
+            cmd.extend(["--query", str(args["query"])])
+        if args.get("role"):
+            cmd.extend(["--role", str(args["role"])])
+        if args.get("prefix"):
+            cmd.extend(["--prefix", str(args["prefix"])])
+        if args.get("suffix"):
+            cmd.extend(["--suffix", str(args["suffix"])])
+        if args.get("mode"):
+            cmd.extend(["--mode", str(args["mode"])])
+    elif command == "applescript":
+        cmd.extend(["--script", str(args["script"])])
+        if args.get("timeout") is not None:
+            cmd.extend(["--timeout", str(args["timeout"])])
+    elif command == "press-key":
+        cmd.extend(["--key", str(args["key"])])
+    elif command == "scroll":
+        if args.get("dx") is not None:
+            cmd.extend(["--dx", str(args["dx"])])
+        if args.get("dy") is not None:
+            cmd.extend(["--dy", str(args["dy"])])
+        if args.get("x") is not None:
+            cmd.extend(["--x", str(args["x"])])
+        if args.get("y") is not None:
+            cmd.extend(["--y", str(args["y"])])
+    elif command == "drag":
+        cmd.extend(["--x1", str(args["x1"]), "--y1", str(args["y1"]), "--x2", str(args["x2"]), "--y2", str(args["y2"])])
+    elif command == "wait-for":
+        add_mac_target(cmd, args)
+        cmd.extend(["--query", str(args["query"])])
+        if args.get("role"):
+            cmd.extend(["--role", str(args["role"])])
+        if args.get("timeout_ms") is not None:
+            cmd.extend(["--timeout-ms", str(args["timeout_ms"])])
+        if args.get("interval_ms") is not None:
+            cmd.extend(["--interval-ms", str(args["interval_ms"])])
+
+    proc = subprocess.run(cmd, cwd=str(WORKSPACE_ROOT), text=True, capture_output=True, timeout=60)
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or proc.stdout or f"command failed: {' '.join(cmd)}").strip())
+    try:
+        parsed = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"invalid JSON from computer-state: {exc}\n{proc.stdout}") from exc
+    return parsed
+
+
+def tool_result(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)}],
+        "structuredContent": payload,
+        "isError": not bool(payload.get("ok", True)),
+    }
+
+
+def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
+    mapping = {
+        "computer_surfaces": "surfaces",
+        "computer_healthcheck": "healthcheck",
+        "computer_list_apps": "list-apps",
+        "computer_app": "app",
+        "computer_get_state": "get-state",
+        "computer_find": "find",
+        "computer_click": "click",
+        "computer_set_value": "set-value",
+        "computer_type_into": "type-into",
+        "computer_perform_action": "perform-action",
+        "computer_select_text": "select-text",
+        "computer_run_applescript": "applescript",
+        "computer_type_text": "type-text",
+        "computer_press_key": "press-key",
+        "computer_scroll": "scroll",
+        "computer_drag": "drag",
+        "computer_wait_for": "wait-for",
+    }
+    if name not in mapping:
+        raise ValueError(f"unknown tool: {name}")
+    return tool_result(run_computer_state(mapping[name], args))
+
+
+def handle(message: dict[str, Any]) -> dict[str, Any] | None:
+    method = message.get("method")
+    message_id = message.get("id")
+    params = message.get("params") or {}
+
+    if method == "initialize":
+        protocol_version = params.get("protocolVersion") or "2024-11-05"
+        return response(
+            message_id,
+            {
+                "protocolVersion": protocol_version,
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+            },
+        )
+    if method == "notifications/initialized":
+        return None
+    if method == "tools/list":
+        return response(message_id, {"tools": TOOLS})
+    if method == "tools/call":
+        name = params.get("name")
+        arguments = params.get("arguments") or {}
+        if not isinstance(arguments, dict):
+            return error_response(message_id, -32602, "arguments must be an object")
+        try:
+            return response(message_id, call_tool(str(name), arguments))
+        except Exception as exc:
+            text = str(exc)
+            if len(text) > 4000:
+                text = text[:3940] + f"\n...[truncated {len(str(exc)) - 3940} chars from tool error]"
+            return response(
+                message_id,
+                {
+                    "content": [{"type": "text", "text": text}],
+                    "isError": True,
+                },
+            )
+    return error_response(message_id, -32601, f"method not found: {method}")
+
+
+def read_message(first_line: bytes) -> dict[str, Any] | None:
+    global USE_CONTENT_LENGTH
+    if first_line.lower().startswith(b"content-length:"):
+        USE_CONTENT_LENGTH = True
+        length_text = first_line.split(b":", 1)[1].strip()
+        try:
+            content_length = int(length_text)
+        except ValueError as exc:
+            raise json.JSONDecodeError("invalid Content-Length", length_text.decode("utf-8", "replace"), 0) from exc
+
+        while True:
+            header = sys.stdin.buffer.readline()
+            if header in (b"\r\n", b"\n", b""):
+                break
+
+        body = sys.stdin.buffer.read(content_length)
+        if not body:
+            return None
+        return json.loads(body.decode("utf-8"))
+
+    line = first_line.strip()
+    if not line:
+        return None
+    return json.loads(line.decode("utf-8"))
+
+
+def main() -> int:
+    while True:
+        first_line = sys.stdin.buffer.readline()
+        if first_line == b"":
+            break
+        try:
+            message = read_message(first_line)
+        except json.JSONDecodeError as exc:
+            emit(error_response(None, -32700, "parse error", str(exc)))
+            continue
+        if message is None:
+            continue
+        if not isinstance(message, dict):
+            emit(error_response(None, -32600, "invalid request"))
+            continue
+        result = handle(message)
+        if result is not None:
+            emit(result)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

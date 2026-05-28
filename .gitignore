@@ -1,0 +1,10 @@
+.control-runs/
+__pycache__/
+*.pyc
+.DS_Store
+*.log
+*.err
+*.tmp
+node_modules/
+.env
+.env.*

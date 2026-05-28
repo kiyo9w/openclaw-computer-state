@@ -1,0 +1,532 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+
+
+WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
+MACCONTROL = WORKSPACE_ROOT / "scripts" / "maccontrol"
+DEFAULT_HOST = os.environ.get("MACCOMPUTER_HOST") or os.environ.get("MACCONTROL_HOST") or "macbox"
+DEFAULT_SCREENSHOT_DIR = WORKSPACE_ROOT / ".control-runs" / "maccomputer"
+
+
+class CliError(Exception):
+    pass
+
+
+def print_json(value: Any) -> None:
+    print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def run_maccontrol(args: list[str], *, host: str = DEFAULT_HOST, timeout: int = 20) -> dict[str, Any]:
+    cmd = [str(MACCONTROL)]
+    if host:
+        cmd.extend(["--host", host])
+    cmd.extend(args)
+    proc = subprocess.run(cmd, cwd=str(WORKSPACE_ROOT), text=True, capture_output=True, timeout=timeout)
+    if proc.returncode != 0:
+        raise CliError((proc.stderr or proc.stdout or f"maccontrol failed: {cmd}").strip())
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise CliError(f"maccontrol returned invalid JSON: {exc}\n{proc.stdout}") from exc
+    if not isinstance(payload, dict):
+        raise CliError("maccontrol returned non-object JSON")
+    return payload
+
+
+def scp_from_mac(host: str, remote_path: str, local_path: Path, timeout: int = 20) -> None:
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", f"{host}:{remote_path}", str(local_path)],
+        cwd=str(WORKSPACE_ROOT),
+        check=True,
+        timeout=timeout,
+    )
+
+
+def app_target_args(args: argparse.Namespace) -> list[str]:
+    out: list[str] = []
+    if getattr(args, "app", None):
+        out.extend(["--name", args.app])
+    if getattr(args, "bundle_id", None):
+        out.extend(["--bundle-id", args.bundle_id])
+    if getattr(args, "pid", None):
+        out.extend(["--pid", str(args.pid)])
+    return out
+
+
+def require_ok(payload: dict[str, Any], action: str) -> None:
+    if payload.get("ok") is not True:
+        raise CliError(f"{action} failed: {json.dumps(payload, ensure_ascii=False)}")
+
+
+def command_tools(args: argparse.Namespace) -> int:
+    tools = [
+        {
+            "name": "list-apps",
+            "description": "List running Mac apps through MacControl.",
+            "args": [],
+            "readOnly": True,
+        },
+        {
+            "name": "app",
+            "description": "Open, focus, or quit a Mac app.",
+            "args": ["open|focus|quit", "--app/--bundle-id"],
+            "readOnly": False,
+        },
+        {
+            "name": "get-state",
+            "description": "State-first snapshot: screenshot plus Accessibility tree for the target app.",
+            "args": ["--app/--bundle-id/--pid", "--max-depth", "--max-nodes", "--copy-screenshot"],
+            "readOnly": True,
+        },
+        {
+            "name": "find",
+            "description": "Find Accessibility elements by visible text/role.",
+            "args": ["--query", "--role", "--app/--bundle-id/--pid"],
+            "readOnly": True,
+        },
+        {
+            "name": "click",
+            "description": "Click by Accessibility element id, query, or screenshot coordinates.",
+            "args": ["--id OR --query OR --x --y", "--app/--bundle-id/--pid"],
+            "readOnly": False,
+        },
+        {
+            "name": "type-text",
+            "description": "Type literal text into the focused control using clipboard paste.",
+            "args": ["--text"],
+            "readOnly": False,
+        },
+        {
+            "name": "set-text",
+            "description": "Set an Accessibility element value directly.",
+            "args": ["--id OR --query", "--text", "--app/--bundle-id/--pid"],
+            "readOnly": False,
+        },
+        {
+            "name": "type-into",
+            "description": "Click an Accessibility element and type text into it.",
+            "args": ["--id OR --query", "--text", "--app/--bundle-id/--pid"],
+            "readOnly": False,
+        },
+        {
+            "name": "perform-action",
+            "description": "Perform a named Accessibility action exposed by an element.",
+            "args": ["--id OR --query", "--action", "--app/--bundle-id/--pid"],
+            "readOnly": False,
+        },
+        {
+            "name": "select-text",
+            "description": "Select target text inside a text Accessibility element, or place the cursor before/after it.",
+            "args": ["--id OR --query", "--text", "--prefix", "--suffix", "--mode select|before|after"],
+            "readOnly": False,
+        },
+        {
+            "name": "applescript",
+            "description": "Run AppleScript through the persistent MacControl app.",
+            "args": ["--script"],
+            "readOnly": False,
+        },
+        {
+            "name": "press-key",
+            "description": "Press a key or key combination, e.g. cmd+l, return, tab.",
+            "args": ["--key"],
+            "readOnly": False,
+        },
+        {
+            "name": "scroll",
+            "description": "Scroll by pixel deltas.",
+            "args": ["--dx", "--dy"],
+            "readOnly": False,
+        },
+        {
+            "name": "drag",
+            "description": "Drag from one screenshot coordinate to another.",
+            "args": ["--x1", "--y1", "--x2", "--y2"],
+            "readOnly": False,
+        },
+        {
+            "name": "wait-for",
+            "description": "Poll Accessibility tree until text/role appears.",
+            "args": ["--query", "--role", "--timeout-ms"],
+            "readOnly": True,
+        },
+        {
+            "name": "healthcheck",
+            "description": "Verify screenshot, Accessibility, clipboard, and signing health.",
+            "args": [],
+            "readOnly": True,
+        },
+    ]
+    print_json({"ok": True, "surface": "maccomputer", "tools": tools})
+    return 0
+
+
+def command_list_apps(args: argparse.Namespace) -> int:
+    print_json(run_maccontrol(["app", "--action", "list"], host=args.host))
+    return 0
+
+
+def command_app(args: argparse.Namespace) -> int:
+    cmd = ["app", "--action", args.mode]
+    if args.app:
+        cmd.extend(["--name", args.app])
+    if args.bundle_id:
+        cmd.extend(["--bundle-id", args.bundle_id])
+    print_json(run_maccontrol(cmd, host=args.host))
+    return 0
+
+
+def command_get_state(args: argparse.Namespace) -> int:
+    remote_path = f"/Users/ngotrung/OpenClawTools/maccomputer-state-{uuid.uuid4().hex}.png"
+    screenshot = run_maccontrol(["screenshot", "--out", remote_path], host=args.host)
+    ax_args = ["ax-snapshot", "--max-depth", str(args.max_depth), "--max-nodes", str(args.max_nodes)]
+    ax_args.extend(app_target_args(args))
+    ax = run_maccontrol(ax_args, host=args.host)
+    require_ok(screenshot, "screenshot")
+    require_ok(ax, "ax-snapshot")
+
+    local_path = None
+    if args.copy_screenshot:
+        dest = Path(args.copy_screenshot)
+        if dest.is_dir() or str(args.copy_screenshot).endswith(os.sep):
+            dest = dest / Path(remote_path).name
+        scp_from_mac(args.host, remote_path, dest)
+        local_path = str(dest)
+    elif args.copy_screenshot_default:
+        DEFAULT_SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+        dest = DEFAULT_SCREENSHOT_DIR / Path(remote_path).name
+        scp_from_mac(args.host, remote_path, dest)
+        local_path = str(dest)
+
+    print_json(
+        {
+            "ok": True,
+            "surface": "maccomputer",
+            "stateModel": "screenshot+accessibility-tree",
+            "capturedAt": int(time.time()),
+            "app": {
+                "pid": ax.get("pid"),
+                "name": ax.get("name"),
+                "bundleIdentifier": ax.get("bundleIdentifier"),
+            },
+            "screenshot": {
+                "remotePath": screenshot.get("path"),
+                "localPath": local_path,
+                "width": screenshot.get("width"),
+                "height": screenshot.get("height"),
+            },
+            "accessibility": {
+                "maxDepth": ax.get("maxDepth"),
+                "maxNodes": ax.get("maxNodes"),
+                "truncated": ax.get("truncated"),
+                "nodes": ax.get("nodes", []),
+            },
+        }
+    )
+    return 0
+
+
+def command_find(args: argparse.Namespace) -> int:
+    cmd = ["ax-find", "--query", args.query, "--limit", str(args.limit)]
+    if args.role:
+        cmd.extend(["--role", args.role])
+    cmd.extend(app_target_args(args))
+    print_json(run_maccontrol(cmd, host=args.host))
+    return 0
+
+
+def command_click(args: argparse.Namespace) -> int:
+    if args.x is not None or args.y is not None:
+        if args.x is None or args.y is None:
+            raise CliError("Both --x and --y are required for coordinate click")
+        print_json(run_maccontrol(["click", "--x", str(args.x), "--y", str(args.y)], host=args.host))
+        return 0
+
+    cmd = ["ax-click"]
+    if args.id is not None:
+        cmd.extend(["--id", str(args.id)])
+    elif args.query:
+        cmd.extend(["--query", args.query])
+    else:
+        raise CliError("Click requires --id, --query, or --x/--y")
+    if args.role:
+        cmd.extend(["--role", args.role])
+    cmd.extend(app_target_args(args))
+    print_json(run_maccontrol(cmd, host=args.host))
+    return 0
+
+
+def command_type_text(args: argparse.Namespace) -> int:
+    print_json(run_maccontrol(["type", "--text", args.text], host=args.host))
+    return 0
+
+
+def command_set_text(args: argparse.Namespace) -> int:
+    cmd = ["ax-set-value", "--text", args.text]
+    if args.id is not None:
+        cmd.extend(["--id", str(args.id)])
+    elif args.query:
+        cmd.extend(["--query", args.query])
+    else:
+        raise CliError("set-text requires --id or --query")
+    if args.role:
+        cmd.extend(["--role", args.role])
+    cmd.extend(app_target_args(args))
+    print_json(run_maccontrol(cmd, host=args.host))
+    return 0
+
+
+def command_type_into(args: argparse.Namespace) -> int:
+    cmd = ["ax-type", "--text", args.text]
+    if args.id is not None:
+        cmd.extend(["--id", str(args.id)])
+    elif args.query:
+        cmd.extend(["--query", args.query])
+    else:
+        raise CliError("type-into requires --id or --query")
+    if args.role:
+        cmd.extend(["--role", args.role])
+    cmd.extend(app_target_args(args))
+    print_json(run_maccontrol(cmd, host=args.host))
+    return 0
+
+
+def command_perform_action(args: argparse.Namespace) -> int:
+    cmd = ["ax-action", "--action", args.action]
+    if args.id is not None:
+        cmd.extend(["--id", str(args.id)])
+    elif args.query:
+        cmd.extend(["--query", args.query])
+    else:
+        raise CliError("perform-action requires --id or --query")
+    if args.role:
+        cmd.extend(["--role", args.role])
+    cmd.extend(app_target_args(args))
+    print_json(run_maccontrol(cmd, host=args.host))
+    return 0
+
+
+def command_select_text(args: argparse.Namespace) -> int:
+    cmd = ["ax-select-text", "--text", args.text, "--mode", args.mode]
+    if args.id is not None:
+        cmd.extend(["--id", str(args.id)])
+    elif args.query:
+        cmd.extend(["--query", args.query])
+    else:
+        raise CliError("select-text requires --id or --query")
+    if args.role:
+        cmd.extend(["--role", args.role])
+    if args.prefix:
+        cmd.extend(["--prefix", args.prefix])
+    if args.suffix:
+        cmd.extend(["--suffix", args.suffix])
+    cmd.extend(app_target_args(args))
+    print_json(run_maccontrol(cmd, host=args.host))
+    return 0
+
+
+def command_applescript(args: argparse.Namespace) -> int:
+    print_json(
+        run_maccontrol(
+            ["applescript", "--script", args.script, "--timeout-ms", str(args.timeout * 1000)],
+            host=args.host,
+            timeout=args.timeout + 5,
+        )
+    )
+    return 0
+
+
+def command_press_key(args: argparse.Namespace) -> int:
+    print_json(run_maccontrol(["hotkey", "--keys", args.key], host=args.host))
+    return 0
+
+
+def command_scroll(args: argparse.Namespace) -> int:
+    print_json(run_maccontrol(["scroll", "--dx", str(args.dx), "--dy", str(args.dy)], host=args.host))
+    return 0
+
+
+def command_drag(args: argparse.Namespace) -> int:
+    print_json(
+        run_maccontrol(
+            [
+                "drag",
+                "--x1",
+                str(args.x1),
+                "--y1",
+                str(args.y1),
+                "--x2",
+                str(args.x2),
+                "--y2",
+                str(args.y2),
+            ],
+            host=args.host,
+        )
+    )
+    return 0
+
+
+def command_wait_for(args: argparse.Namespace) -> int:
+    cmd = ["ax-wait-for", "--query", args.query, "--timeout-ms", str(args.timeout_ms)]
+    if args.role:
+        cmd.extend(["--role", args.role])
+    cmd.extend(app_target_args(args))
+    print_json(run_maccontrol(cmd, host=args.host, timeout=max(20, int(args.timeout_ms / 1000) + 20)))
+    return 0
+
+
+def command_healthcheck(args: argparse.Namespace) -> int:
+    print_json(run_maccontrol(["healthcheck"], host=args.host))
+    return 0
+
+
+def add_target_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--app", help="Target app name, matched case-insensitively")
+    parser.add_argument("--bundle-id", help="Target app bundle identifier")
+    parser.add_argument("--pid", type=int, help="Target app process id")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="State-first Mac desktop control wrapper built on OpenClaw MacControl.",
+    )
+    parser.add_argument("--host", default=DEFAULT_HOST, help=f"SSH host alias for macbox (default: {DEFAULT_HOST})")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("tools")
+    p.set_defaults(func=command_tools)
+
+    p = sub.add_parser("list-apps")
+    p.set_defaults(func=command_list_apps)
+
+    p = sub.add_parser("app")
+    p.add_argument("mode", choices=["open", "focus", "quit"])
+    add_target_options(p)
+    p.set_defaults(func=command_app)
+
+    p = sub.add_parser("get-state")
+    add_target_options(p)
+    p.add_argument("--max-depth", type=int, default=5)
+    p.add_argument("--max-nodes", type=int, default=300)
+    p.add_argument("--copy-screenshot", help="Copy the screenshot from macbox to this local path")
+    p.add_argument(
+        "--copy-screenshot-default",
+        action="store_true",
+        help="Copy screenshot into .control-runs/maccomputer for local vision/debugging",
+    )
+    p.set_defaults(func=command_get_state)
+
+    p = sub.add_parser("find")
+    add_target_options(p)
+    p.add_argument("--query", required=True)
+    p.add_argument("--role")
+    p.add_argument("--limit", type=int, default=20)
+    p.set_defaults(func=command_find)
+
+    p = sub.add_parser("click")
+    add_target_options(p)
+    p.add_argument("--id", type=int)
+    p.add_argument("--query")
+    p.add_argument("--role")
+    p.add_argument("--x", type=float)
+    p.add_argument("--y", type=float)
+    p.set_defaults(func=command_click)
+
+    p = sub.add_parser("type-text")
+    p.add_argument("--text", required=True)
+    p.set_defaults(func=command_type_text)
+
+    p = sub.add_parser("set-text")
+    add_target_options(p)
+    p.add_argument("--id", type=int)
+    p.add_argument("--query")
+    p.add_argument("--role")
+    p.add_argument("--text", required=True)
+    p.set_defaults(func=command_set_text)
+
+    p = sub.add_parser("type-into")
+    add_target_options(p)
+    p.add_argument("--id", type=int)
+    p.add_argument("--query")
+    p.add_argument("--role")
+    p.add_argument("--text", required=True)
+    p.set_defaults(func=command_type_into)
+
+    p = sub.add_parser("perform-action")
+    add_target_options(p)
+    p.add_argument("--id", type=int)
+    p.add_argument("--query")
+    p.add_argument("--role")
+    p.add_argument("--action", required=True)
+    p.set_defaults(func=command_perform_action)
+
+    p = sub.add_parser("select-text")
+    add_target_options(p)
+    p.add_argument("--id", type=int)
+    p.add_argument("--query")
+    p.add_argument("--role")
+    p.add_argument("--text", required=True)
+    p.add_argument("--prefix")
+    p.add_argument("--suffix")
+    p.add_argument("--mode", choices=["select", "before", "after"], default="select")
+    p.set_defaults(func=command_select_text)
+
+    p = sub.add_parser("applescript")
+    p.add_argument("--script", required=True)
+    p.add_argument("--timeout", type=int, default=20)
+    p.set_defaults(func=command_applescript)
+
+    p = sub.add_parser("press-key")
+    p.add_argument("--key", required=True, help="Key combination, e.g. cmd+l, return, tab")
+    p.set_defaults(func=command_press_key)
+
+    p = sub.add_parser("scroll")
+    p.add_argument("--dx", type=int, default=0)
+    p.add_argument("--dy", type=int, default=0)
+    p.set_defaults(func=command_scroll)
+
+    p = sub.add_parser("drag")
+    p.add_argument("--x1", type=float, required=True)
+    p.add_argument("--y1", type=float, required=True)
+    p.add_argument("--x2", type=float, required=True)
+    p.add_argument("--y2", type=float, required=True)
+    p.set_defaults(func=command_drag)
+
+    p = sub.add_parser("wait-for")
+    add_target_options(p)
+    p.add_argument("--query", required=True)
+    p.add_argument("--role")
+    p.add_argument("--timeout-ms", type=int, default=10000)
+    p.set_defaults(func=command_wait_for)
+
+    p = sub.add_parser("healthcheck")
+    p.set_defaults(func=command_healthcheck)
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        return args.func(args)
+    except subprocess.CalledProcessError as exc:
+        print_json({"ok": False, "error": f"command failed: {exc}", "returncode": exc.returncode})
+        return exc.returncode or 1
+    except (CliError, subprocess.TimeoutExpired) as exc:
+        print_json({"ok": False, "error": str(exc)})
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

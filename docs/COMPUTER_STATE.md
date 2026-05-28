@@ -1,0 +1,144 @@
+# COMPUTER_STATE.md
+
+Unified state-first desktop control facade for OpenClaw.
+
+## Entrypoint
+
+```bash
+scripts/computer-state surfaces
+scripts/computer-state tools
+scripts/computer-state healthcheck --surface mac
+scripts/computer-state healthcheck --surface win
+scripts/computer-state app --surface mac focus --name "ChatGPT Atlas"
+scripts/computer-state app --surface win switch --name Brave
+```
+
+MCP stdio wrapper:
+
+```bash
+scripts/computer-state-mcp
+```
+
+Surfaces:
+
+- `mac`: wraps `scripts/maccomputer`, which wraps `MacControl` on `macbox`.
+- `win`: wraps `scripts/windows-mcp-call` plus `scripts/wincontrol` for screenshot file capture.
+
+## Rule
+
+For GUI work, call `get-state` first:
+
+```bash
+scripts/computer-state get-state --surface mac --app "ChatGPT Atlas" --copy-screenshot-default
+scripts/computer-state get-state --surface win --copy-screenshot-default --max-chars 20000
+```
+
+Then act using semantic targets whenever possible:
+
+```bash
+scripts/computer-state find --surface mac --app "ChatGPT Atlas" --query Help --role MenuBarItem
+scripts/computer-state click --surface mac --app "ChatGPT Atlas" --id 437
+scripts/computer-state set-value --surface mac --app "ChatGPT Atlas" --id 437 --text "hello"
+scripts/computer-state select-text --surface mac --app TextEdit --query AXTextArea --role TextArea --text beta --prefix "gamma " --suffix " omega" --mode select
+scripts/computer-state perform-action --surface mac --app "ChatGPT Atlas" --query Help --role MenuBarItem --action AXPress
+scripts/computer-state applescript --surface mac --script 'return "hello"'
+scripts/computer-state scroll --surface mac --dy -600
+scripts/computer-state drag --surface mac --x1 400 --y1 400 --x2 700 --y2 700
+scripts/computer-state wait-for --surface mac --app "ChatGPT Atlas" --query Help --role MenuBarItem --timeout-ms 3000
+
+scripts/computer-state find --surface win --query "Message" --limit 5
+scripts/computer-state click --surface win --x 948 --y 987
+scripts/computer-state type-text --surface win --x 948 --y 987 --text "hello"
+scripts/computer-state scroll --surface win --dy -120 --x 948 --y 987
+scripts/computer-state drag --surface win --x1 500 --y1 500 --x2 700 --y2 700
+scripts/computer-state wait-for --surface win --query Message --timeout-ms 3000
+```
+
+Windows snapshots are capped at 20k chars by default to avoid agent context overflow. Use `--max-chars 0` only when the full UI tree is explicitly needed. Windows `find` caps each matched line at 500 chars by default for the same reason.
+
+Use raw `--x/--y` only when semantic targets are unavailable.
+
+## Why this exists
+
+Codex Computer Use is strong because it has a state model: screenshot plus Accessibility/UI tree before actions. Previously OpenClaw had strong primitives, but operators needed to remember separate commands:
+
+- `scripts/maccontrol`
+- `scripts/maccomputer`
+- `scripts/wincontrol`
+- `scripts/windows-mcp-call`
+
+`scripts/computer-state` is a thin facade so agents can reason in one vocabulary:
+
+- `get-state`
+- `find`
+- `click`
+- `set-value`
+- `type-into`
+- `perform-action`
+- `select-text`
+- `applescript`
+- `type-text`
+- `press-key`
+- `scroll`
+- `drag`
+- `wait-for`
+- `list-apps`
+- `app`
+- `healthcheck`
+
+`scripts/computer-state-mcp` exposes the same vocabulary as MCP tools:
+
+- `computer_surfaces`
+- `computer_healthcheck`
+- `computer_list_apps`
+- `computer_app`
+- `computer_get_state`
+- `computer_find`
+- `computer_click`
+- `computer_set_value`
+- `computer_type_into`
+- `computer_perform_action`
+- `computer_select_text`
+- `computer_run_applescript`
+- `computer_type_text`
+- `computer_press_key`
+- `computer_scroll`
+- `computer_drag`
+- `computer_wait_for`
+
+The MCP server supports both newline-delimited JSON-RPC for smoke tests and `Content-Length` framing for MCP stdio clients. Keep it local/test-only until wiring it into OpenClaw/Codex config intentionally.
+
+Smoke test:
+
+```bash
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{}}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"computer_healthcheck","arguments":{"surface":"mac"}}}' \
+  | scripts/computer-state-mcp
+```
+
+## Verification
+
+Verified on 2026-05-28:
+
+```bash
+python3 -m py_compile scripts/computer-state
+python3 -m py_compile scripts/computer-state-mcp
+scripts/computer-state healthcheck --surface mac
+scripts/computer-state healthcheck --surface win
+scripts/computer-state get-state --surface mac --app "ChatGPT Atlas" --copy-screenshot-default
+scripts/computer-state get-state --surface win --copy-screenshot-default --max-chars 20000
+scripts/computer-state find --surface mac --app "ChatGPT Atlas" --query Help --role MenuBarItem
+scripts/computer-state find --surface win --query Brave --limit 3
+scripts/computer-state list-apps --surface mac
+scripts/computer-state list-apps --surface win --limit 5
+scripts/computer-state scroll --surface mac --dy 0
+scripts/computer-state perform-action --surface mac --app "ChatGPT Atlas" --query Help --role MenuBarItem --action AXPress
+scripts/computer-state applescript --surface mac --script 'return "applescript-ok"' --timeout 5
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"computer_find","arguments":{"surface":"win","query":"Brave","limit":2}}}' | scripts/computer-state-mcp
+```
+
+## Safety
+
+This facade does not remove the existing safety gates in `windows-mcp-call`. For GUI actions, still apply the Computer Use confirmation policy: confirm before delete/send/purchase/security-setting/API-key/install/sensitive-data transmission steps.

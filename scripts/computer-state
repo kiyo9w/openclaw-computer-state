@@ -1,0 +1,737 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import time
+import uuid
+from pathlib import Path
+from pathlib import PureWindowsPath
+from typing import Any
+
+
+WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
+MACCOMPUTER = WORKSPACE_ROOT / "scripts" / "maccomputer"
+WINDOWS_MCP = WORKSPACE_ROOT / "scripts" / "windows-mcp-call"
+WINCONTROL = WORKSPACE_ROOT / "scripts" / "wincontrol"
+DEFAULT_RUN_DIR = WORKSPACE_ROOT / ".control-runs" / "computer-state"
+
+
+class CliError(Exception):
+    pass
+
+
+def print_json(value: Any) -> None:
+    print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def run_json(cmd: list[str], *, timeout: int = 30) -> dict[str, Any]:
+    proc = subprocess.run(cmd, cwd=str(WORKSPACE_ROOT), text=True, capture_output=True, timeout=timeout)
+    if proc.returncode != 0:
+        raise CliError((proc.stderr or proc.stdout or f"command failed: {' '.join(cmd)}").strip())
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise CliError(f"invalid JSON from {' '.join(cmd)}: {exc}\n{proc.stdout}") from exc
+    if not isinstance(payload, dict):
+        raise CliError("expected JSON object")
+    return payload
+
+
+def run_json_allow_status(cmd: list[str], *, timeout: int = 30) -> tuple[dict[str, Any], int]:
+    proc = subprocess.run(cmd, cwd=str(WORKSPACE_ROOT), text=True, capture_output=True, timeout=timeout)
+    raw = proc.stdout or proc.stderr
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        if proc.returncode != 0:
+            raise CliError((proc.stderr or proc.stdout or f"command failed: {' '.join(cmd)}").strip())
+        raise CliError(f"invalid JSON from {' '.join(cmd)}: {exc}\n{raw}") from exc
+    if not isinstance(payload, dict):
+        raise CliError("expected JSON object")
+    return payload, proc.returncode
+
+
+def run_text(cmd: list[str], *, timeout: int = 30) -> str:
+    proc = subprocess.run(cmd, cwd=str(WORKSPACE_ROOT), text=True, capture_output=True, timeout=timeout)
+    if proc.returncode != 0:
+        raise CliError((proc.stderr or proc.stdout or f"command failed: {' '.join(cmd)}").strip())
+    return proc.stdout
+
+
+def mac_args(args: argparse.Namespace) -> list[str]:
+    out = [str(MACCOMPUTER), "--host", args.host]
+    return out
+
+
+def windows_global_args(args: argparse.Namespace) -> list[str]:
+    out = [str(WINDOWS_MCP)]
+    if getattr(args, "endpoint", None):
+        out.extend(["--endpoint", args.endpoint])
+    if getattr(args, "ledger_run", None):
+        out.extend(["--ledger-run", args.ledger_run])
+    if getattr(args, "allow_sensitive", False):
+        out.append("--allow-sensitive")
+    return out
+
+
+def normalize_win_snapshot_text(text: str) -> str:
+    replacements = {
+        "âââ": "├──",
+        "âââ": "└──",
+        "â": "│",
+        "â": "─",
+        "â": "",
+        "â": "–",
+        "â": "—",
+        "â¦": "…",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return re.sub(r"[\uFFFD]+", "", text)
+
+
+def truncate_text(text: str, max_chars: int, flag: str = "--max-chars") -> tuple[str, bool, int]:
+    original_len = len(text)
+    if max_chars <= 0 or original_len <= max_chars:
+        return text, False, original_len
+    suffix = f"\n...[truncated {original_len - max_chars} chars; rerun with {flag} 0 for full output]"
+    keep = max(0, max_chars - len(suffix))
+    return text[:keep] + suffix, True, original_len
+
+
+def command_surfaces(args: argparse.Namespace) -> int:
+    print_json(
+        {
+            "ok": True,
+            "surfaces": [
+                {
+                    "name": "mac",
+                    "backend": "scripts/maccomputer -> MacControl AX+screenshot on macbox",
+                    "state": "screenshot+accessibility-tree",
+                },
+                {
+                    "name": "win",
+                    "backend": "scripts/windows-mcp-call + wincontrol screenshot on Windows host",
+                    "state": "windows-mcp Snapshot semantic tree + optional screenshot file",
+                },
+            ],
+        }
+    )
+    return 0
+
+
+def command_tools(args: argparse.Namespace) -> int:
+    print_json(
+        {
+            "ok": True,
+            "name": "computer-state",
+            "commands": [
+                "surfaces",
+                "tools",
+                "healthcheck",
+                "list-apps",
+                "app",
+                "get-state",
+                "find",
+                "click",
+                "set-value",
+                "type-into",
+                "perform-action",
+                "select-text",
+                "applescript",
+                "type-text",
+                "press-key",
+                "scroll",
+                "drag",
+                "wait-for",
+            ],
+            "rule": "Call get-state before GUI actions. Prefer semantic ids/labels/loc over raw coordinates.",
+        }
+    )
+    return 0
+
+
+def command_healthcheck(args: argparse.Namespace) -> int:
+    if args.surface == "mac":
+        payload = run_json(mac_args(args) + ["healthcheck"], timeout=20)
+        print_json({"ok": bool(payload.get("ok")), "surface": "mac", "backend": payload})
+        return 0 if payload.get("ok") else 1
+
+    snapshot = run_json(windows_global_args(args) + ["snapshot", "--output", "compact"], timeout=20)
+    ok = bool(snapshot.get("ok"))
+    print_json(
+        {
+            "ok": ok,
+            "surface": "win",
+            "server": snapshot.get("server"),
+            "hasSnapshotText": bool(snapshot.get("text")),
+        }
+    )
+    return 0 if ok else 1
+
+
+def command_list_apps(args: argparse.Namespace) -> int:
+    if args.surface == "mac":
+        payload = run_json(mac_args(args) + ["list-apps"], timeout=40)
+        apps = payload.get("apps")
+        if isinstance(apps, list) and args.limit > 0:
+            payload["apps"] = apps[: args.limit]
+            payload["truncated"] = len(apps) > args.limit
+            payload["totalApps"] = len(apps)
+            payload["limit"] = args.limit
+        print_json(payload)
+        return 0
+    payload = run_json(windows_global_args(args) + ["process", "list", "--limit", str(args.limit), "--output", "compact"], timeout=30)
+    print_json({"ok": bool(payload.get("ok")), "surface": "win", "backend": "windows-mcp Process list", "result": payload})
+    return 0
+
+
+def command_app(args: argparse.Namespace) -> int:
+    if args.surface == "mac":
+        mode_map = {"launch": "open", "switch": "focus", "quit": "quit", "open": "open", "focus": "focus"}
+        mode = mode_map.get(args.mode)
+        if not mode:
+            raise CliError(f"Mac app mode not supported: {args.mode}")
+        cmd = mac_args(args) + ["app", mode]
+        if args.name:
+            cmd.extend(["--app", args.name])
+        if args.bundle_id:
+            cmd.extend(["--bundle-id", args.bundle_id])
+        print_json(run_json(cmd, timeout=20))
+        return 0
+
+    mode_map = {"open": "launch", "focus": "switch", "launch": "launch", "switch": "switch", "resize": "resize"}
+    mode = mode_map.get(args.mode)
+    if not mode:
+        raise CliError(f"Windows app mode not supported: {args.mode}")
+    cmd = windows_global_args(args) + ["app", mode, "--output", "compact"]
+    if args.name:
+        cmd.extend(["--name", args.name])
+    if args.window_x is not None and args.window_y is not None:
+        cmd.extend(["--window-loc", str(args.window_x), str(args.window_y)])
+    if args.window_width is not None and args.window_height is not None:
+        cmd.extend(["--window-size", str(args.window_width), str(args.window_height)])
+    print_json(run_json(cmd, timeout=20))
+    return 0
+
+
+def command_get_state(args: argparse.Namespace) -> int:
+    if args.surface == "mac":
+        cmd = mac_args(args) + ["get-state", "--max-depth", str(args.max_depth), "--max-nodes", str(args.max_nodes)]
+        if args.app:
+            cmd.extend(["--app", args.app])
+        if args.bundle_id:
+            cmd.extend(["--bundle-id", args.bundle_id])
+        if args.pid:
+            cmd.extend(["--pid", str(args.pid)])
+        if args.copy_screenshot:
+            cmd.extend(["--copy-screenshot", args.copy_screenshot])
+        if args.copy_screenshot_default:
+            cmd.append("--copy-screenshot-default")
+        print_json(run_json(cmd, timeout=40))
+        return 0
+
+    snapshot = run_json(windows_global_args(args) + ["snapshot", "--output", "compact"], timeout=30)
+    screenshot_info: dict[str, Any] | None = None
+    if args.copy_screenshot or args.copy_screenshot_default:
+        DEFAULT_RUN_DIR.mkdir(parents=True, exist_ok=True)
+        win_path = rf"C:\Users\ngoka\OpenClawTools\computer-state-{uuid.uuid4().hex}.png"
+        win_name = PureWindowsPath(win_path).name
+        local_path = Path(args.copy_screenshot) if args.copy_screenshot else DEFAULT_RUN_DIR / win_name
+        run_text([str(WINCONTROL), "-Action", "screenshot", "-Out", win_path], timeout=20)
+        mounted = Path("/mnt/c/Users/ngoka/OpenClawTools") / win_name
+        if mounted.exists():
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(mounted, local_path)
+            screenshot_info = {"windowsPath": win_path, "localPath": str(local_path), "bytes": local_path.stat().st_size}
+        else:
+            screenshot_info = {"windowsPath": win_path, "localPath": None, "error": "mounted screenshot missing"}
+
+    original_text = normalize_win_snapshot_text(str(snapshot.get("text") or ""))
+    text, truncated, original_len = truncate_text(original_text, args.max_chars)
+    print_json(
+        {
+            "ok": bool(snapshot.get("ok")),
+            "surface": "win",
+            "stateModel": "windows-mcp-snapshot+screenshot",
+            "capturedAt": int(time.time()),
+            "server": snapshot.get("server"),
+            "screenshot": screenshot_info,
+            "snapshotText": text,
+            "snapshotChars": len(text),
+            "originalSnapshotChars": original_len,
+            "truncated": truncated,
+        }
+    )
+    return 0 if snapshot.get("ok") else 1
+
+
+def command_find(args: argparse.Namespace) -> int:
+    if args.surface == "mac":
+        cmd = mac_args(args) + ["find", "--query", args.query, "--limit", str(args.limit)]
+        if args.role:
+            cmd.extend(["--role", args.role])
+        if args.app:
+            cmd.extend(["--app", args.app])
+        if args.bundle_id:
+            cmd.extend(["--bundle-id", args.bundle_id])
+        if args.pid:
+            cmd.extend(["--pid", str(args.pid)])
+        print_json(run_json(cmd, timeout=30))
+        return 0
+    payload, _ = run_json_allow_status(
+        windows_global_args(args) + ["snapshot-find", args.query, "--limit", str(args.limit), "--output", "json"],
+        timeout=30,
+    )
+    matches = []
+    for line in payload.get("matches", []):
+        text, truncated, original_len = truncate_text(
+            normalize_win_snapshot_text(str(line)),
+            args.max_match_chars,
+            "--max-match-chars",
+        )
+        matches.append({"text": text, "truncated": truncated, "originalChars": original_len})
+    payload["matches"] = matches
+    payload["maxMatchChars"] = args.max_match_chars
+    payload["ok"] = True
+    payload["surface"] = "win"
+    print_json(payload)
+    return 0
+
+
+def command_click(args: argparse.Namespace) -> int:
+    if args.surface == "mac":
+        cmd = mac_args(args) + ["click"]
+        if args.id is not None:
+            cmd.extend(["--id", str(args.id)])
+        elif args.query:
+            cmd.extend(["--query", args.query])
+        elif args.x is not None and args.y is not None:
+            cmd.extend(["--x", str(args.x), "--y", str(args.y)])
+        else:
+            raise CliError("click requires --id, --query, or --x/--y")
+        if args.role:
+            cmd.extend(["--role", args.role])
+        if args.app:
+            cmd.extend(["--app", args.app])
+        if args.bundle_id:
+            cmd.extend(["--bundle-id", args.bundle_id])
+        print_json(run_json(cmd, timeout=20))
+        return 0
+
+    if args.label:
+        cmd = windows_global_args(args) + ["click", "--label", args.label, "--output", "compact"]
+    elif args.x is not None and args.y is not None:
+        cmd = windows_global_args(args) + ["click", "--loc", str(int(args.x)), str(int(args.y)), "--output", "compact"]
+    else:
+        raise CliError("Windows click requires --label or --x/--y")
+    if args.button:
+        cmd.extend(["--button", args.button])
+    if args.clicks:
+        cmd.extend(["--clicks", str(args.clicks)])
+    print_json(run_json(cmd, timeout=20))
+    return 0
+
+
+def command_set_value(args: argparse.Namespace) -> int:
+    if args.surface == "mac":
+        cmd = mac_args(args) + ["set-text", "--text", args.text]
+        if args.id is not None:
+            cmd.extend(["--id", str(args.id)])
+        elif args.query:
+            cmd.extend(["--query", args.query])
+        else:
+            raise CliError("Mac set-value requires --id or --query")
+        if args.role:
+            cmd.extend(["--role", args.role])
+        if args.app:
+            cmd.extend(["--app", args.app])
+        if args.bundle_id:
+            cmd.extend(["--bundle-id", args.bundle_id])
+        print_json(run_json(cmd, timeout=20))
+        return 0
+
+    cmd = windows_global_args(args) + ["type", args.text, "--clear", "--output", "compact"]
+    if args.label:
+        cmd.extend(["--label", args.label])
+    elif args.x is not None and args.y is not None:
+        cmd.extend(["--loc", str(int(args.x)), str(int(args.y))])
+    else:
+        raise CliError("Windows set-value requires --label or --x/--y")
+    if args.enter:
+        cmd.append("--enter")
+    print_json(run_json(cmd, timeout=20))
+    return 0
+
+
+def command_type_into(args: argparse.Namespace) -> int:
+    if args.surface == "mac":
+        cmd = mac_args(args) + ["type-into", "--text", args.text]
+        if args.id is not None:
+            cmd.extend(["--id", str(args.id)])
+        elif args.query:
+            cmd.extend(["--query", args.query])
+        else:
+            raise CliError("Mac type-into requires --id or --query")
+        if args.role:
+            cmd.extend(["--role", args.role])
+        if args.app:
+            cmd.extend(["--app", args.app])
+        if args.bundle_id:
+            cmd.extend(["--bundle-id", args.bundle_id])
+        print_json(run_json(cmd, timeout=20))
+        return 0
+
+    return command_type_text(args)
+
+
+def command_perform_action(args: argparse.Namespace) -> int:
+    if args.surface != "mac":
+        raise CliError("perform-action is only implemented for Mac Accessibility actions")
+    cmd = mac_args(args) + ["perform-action", "--action", args.action]
+    if args.id is not None:
+        cmd.extend(["--id", str(args.id)])
+    elif args.query:
+        cmd.extend(["--query", args.query])
+    else:
+        raise CliError("perform-action requires --id or --query")
+    if args.role:
+        cmd.extend(["--role", args.role])
+    if args.app:
+        cmd.extend(["--app", args.app])
+    if args.bundle_id:
+        cmd.extend(["--bundle-id", args.bundle_id])
+    print_json(run_json(cmd, timeout=20))
+    return 0
+
+
+def command_select_text(args: argparse.Namespace) -> int:
+    if args.surface != "mac":
+        raise CliError("select-text is only implemented for Mac Accessibility text elements")
+    cmd = mac_args(args) + ["select-text", "--text", args.text, "--mode", args.mode]
+    if args.id is not None:
+        cmd.extend(["--id", str(args.id)])
+    elif args.query:
+        cmd.extend(["--query", args.query])
+    else:
+        raise CliError("select-text requires --id or --query")
+    if args.role:
+        cmd.extend(["--role", args.role])
+    if args.prefix:
+        cmd.extend(["--prefix", args.prefix])
+    if args.suffix:
+        cmd.extend(["--suffix", args.suffix])
+    if args.app:
+        cmd.extend(["--app", args.app])
+    if args.bundle_id:
+        cmd.extend(["--bundle-id", args.bundle_id])
+    print_json(run_json(cmd, timeout=20))
+    return 0
+
+
+def command_applescript(args: argparse.Namespace) -> int:
+    if args.surface != "mac":
+        raise CliError("applescript is only implemented for Mac")
+    print_json(run_json(mac_args(args) + ["applescript", "--script", args.script, "--timeout", str(args.timeout)], timeout=args.timeout + 5))
+    return 0
+
+
+def command_type_text(args: argparse.Namespace) -> int:
+    if args.surface == "mac":
+        print_json(run_json(mac_args(args) + ["type-text", "--text", args.text], timeout=20))
+        return 0
+    cmd = windows_global_args(args) + ["type", args.text, "--output", "compact"]
+    if args.label:
+        cmd.extend(["--label", args.label])
+    elif args.x is not None and args.y is not None:
+        cmd.extend(["--loc", str(int(args.x)), str(int(args.y))])
+    else:
+        raise CliError("Windows type-text requires --label or --x/--y")
+    if args.clear:
+        cmd.append("--clear")
+    if args.enter:
+        cmd.append("--enter")
+    print_json(run_json(cmd, timeout=20))
+    return 0
+
+
+def command_press_key(args: argparse.Namespace) -> int:
+    if args.surface == "mac":
+        print_json(run_json(mac_args(args) + ["press-key", "--key", args.key], timeout=20))
+        return 0
+    print_json(run_json(windows_global_args(args) + ["shortcut", args.key, "--output", "compact"], timeout=20))
+    return 0
+
+
+def command_scroll(args: argparse.Namespace) -> int:
+    if args.surface == "mac":
+        print_json(run_json(mac_args(args) + ["scroll", "--dx", str(args.dx), "--dy", str(args.dy)], timeout=20))
+        return 0
+    cmd = [str(WINCONTROL), "-Action", "scroll", "-Dx", str(args.dx), "-Dy", str(args.dy)]
+    if args.x is not None and args.y is not None:
+        cmd.extend(["-X", str(int(args.x)), "-Y", str(int(args.y))])
+    print_json(json.loads(run_text(cmd, timeout=20)))
+    return 0
+
+
+def command_drag(args: argparse.Namespace) -> int:
+    if args.surface == "mac":
+        print_json(
+            run_json(
+                mac_args(args)
+                + [
+                    "drag",
+                    "--x1",
+                    str(args.x1),
+                    "--y1",
+                    str(args.y1),
+                    "--x2",
+                    str(args.x2),
+                    "--y2",
+                    str(args.y2),
+                ],
+                timeout=20,
+            )
+        )
+        return 0
+    print_json(
+        json.loads(
+            run_text(
+                [
+                    str(WINCONTROL),
+                    "-Action",
+                    "drag",
+                    "-X",
+                    str(int(args.x1)),
+                    "-Y",
+                    str(int(args.y1)),
+                    "-X2",
+                    str(int(args.x2)),
+                    "-Y2",
+                    str(int(args.y2)),
+                ],
+                timeout=20,
+            )
+        )
+    )
+    return 0
+
+
+def command_wait_for(args: argparse.Namespace) -> int:
+    if args.surface == "mac":
+        cmd = mac_args(args) + ["wait-for", "--query", args.query, "--timeout-ms", str(args.timeout_ms)]
+        if args.role:
+            cmd.extend(["--role", args.role])
+        if args.app:
+            cmd.extend(["--app", args.app])
+        if args.bundle_id:
+            cmd.extend(["--bundle-id", args.bundle_id])
+        if args.pid:
+            cmd.extend(["--pid", str(args.pid)])
+        print_json(run_json(cmd, timeout=max(25, int(args.timeout_ms / 1000) + 25)))
+        return 0
+    deadline = time.time() + (args.timeout_ms / 1000)
+    attempts = 0
+    last_payload: dict[str, Any] | None = None
+    while time.time() < deadline:
+        attempts += 1
+        payload, _ = run_json_allow_status(
+            windows_global_args(args) + ["snapshot-find", args.query, "--limit", "1", "--output", "json"],
+            timeout=30,
+        )
+        last_payload = payload
+        if payload.get("matches"):
+            print_json({"ok": True, "surface": "win", "query": args.query, "attempts": attempts, "match": payload["matches"][0]})
+            return 0
+        time.sleep(max(args.interval_ms, 50) / 1000)
+    print_json({"ok": False, "surface": "win", "error": "timeout", "query": args.query, "attempts": attempts, "last": last_payload})
+    return 1
+
+
+def add_surface(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--surface", choices=["mac", "win"], default="mac")
+    parser.add_argument("--host", default=os.environ.get("MACCOMPUTER_HOST", "macbox"))
+    parser.add_argument("--endpoint", default=os.environ.get("WINDOWS_MCP_ENDPOINT", "http://127.0.0.1:8001/mcp"))
+    parser.add_argument("--ledger-run")
+    parser.add_argument("--allow-sensitive", action="store_true")
+
+
+def add_target(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--app")
+    parser.add_argument("--bundle-id")
+    parser.add_argument("--pid", type=int)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Unified state-first desktop control facade for Mac and Windows.")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("surfaces")
+    p.set_defaults(func=command_surfaces)
+
+    p = sub.add_parser("tools")
+    p.set_defaults(func=command_tools)
+
+    p = sub.add_parser("healthcheck")
+    add_surface(p)
+    p.set_defaults(func=command_healthcheck)
+
+    p = sub.add_parser("list-apps")
+    add_surface(p)
+    p.add_argument("--limit", type=int, default=50)
+    p.set_defaults(func=command_list_apps)
+
+    p = sub.add_parser("app")
+    add_surface(p)
+    p.add_argument("mode", choices=["open", "focus", "quit", "launch", "switch", "resize"])
+    p.add_argument("--name")
+    p.add_argument("--bundle-id")
+    p.add_argument("--window-x", type=int)
+    p.add_argument("--window-y", type=int)
+    p.add_argument("--window-width", type=int)
+    p.add_argument("--window-height", type=int)
+    p.set_defaults(func=command_app)
+
+    p = sub.add_parser("get-state")
+    add_surface(p)
+    add_target(p)
+    p.add_argument("--max-depth", type=int, default=5)
+    p.add_argument("--max-nodes", type=int, default=300)
+    p.add_argument("--max-chars", type=int, default=20000, help="Windows snapshot text character cap; 0 means unlimited")
+    p.add_argument("--copy-screenshot")
+    p.add_argument("--copy-screenshot-default", action="store_true")
+    p.set_defaults(func=command_get_state)
+
+    p = sub.add_parser("find")
+    add_surface(p)
+    add_target(p)
+    p.add_argument("--query", required=True)
+    p.add_argument("--role")
+    p.add_argument("--limit", type=int, default=20)
+    p.add_argument("--max-match-chars", type=int, default=500, help="Windows per-match character cap; 0 means unlimited")
+    p.set_defaults(func=command_find)
+
+    p = sub.add_parser("click")
+    add_surface(p)
+    add_target(p)
+    p.add_argument("--id", type=int)
+    p.add_argument("--query")
+    p.add_argument("--role")
+    p.add_argument("--label")
+    p.add_argument("--x", type=float)
+    p.add_argument("--y", type=float)
+    p.add_argument("--button", choices=["left", "right", "middle"], default="left")
+    p.add_argument("--clicks", type=int, default=1)
+    p.set_defaults(func=command_click)
+
+    p = sub.add_parser("set-value")
+    add_surface(p)
+    add_target(p)
+    p.add_argument("--text", required=True)
+    p.add_argument("--id", type=int)
+    p.add_argument("--query")
+    p.add_argument("--role")
+    p.add_argument("--label")
+    p.add_argument("--x", type=float)
+    p.add_argument("--y", type=float)
+    p.add_argument("--enter", action="store_true")
+    p.set_defaults(func=command_set_value)
+
+    p = sub.add_parser("type-into")
+    add_surface(p)
+    add_target(p)
+    p.add_argument("--text", required=True)
+    p.add_argument("--id", type=int)
+    p.add_argument("--query")
+    p.add_argument("--role")
+    p.add_argument("--label")
+    p.add_argument("--x", type=float)
+    p.add_argument("--y", type=float)
+    p.add_argument("--clear", action="store_true")
+    p.add_argument("--enter", action="store_true")
+    p.set_defaults(func=command_type_into)
+
+    p = sub.add_parser("perform-action")
+    add_surface(p)
+    add_target(p)
+    p.add_argument("--action", required=True)
+    p.add_argument("--id", type=int)
+    p.add_argument("--query")
+    p.add_argument("--role")
+    p.set_defaults(func=command_perform_action)
+
+    p = sub.add_parser("select-text")
+    add_surface(p)
+    add_target(p)
+    p.add_argument("--text", required=True)
+    p.add_argument("--id", type=int)
+    p.add_argument("--query")
+    p.add_argument("--role")
+    p.add_argument("--prefix")
+    p.add_argument("--suffix")
+    p.add_argument("--mode", choices=["select", "before", "after"], default="select")
+    p.set_defaults(func=command_select_text)
+
+    p = sub.add_parser("applescript")
+    add_surface(p)
+    p.add_argument("--script", required=True)
+    p.add_argument("--timeout", type=int, default=20)
+    p.set_defaults(func=command_applescript)
+
+    p = sub.add_parser("type-text")
+    add_surface(p)
+    p.add_argument("--text", required=True)
+    p.add_argument("--label")
+    p.add_argument("--x", type=float)
+    p.add_argument("--y", type=float)
+    p.add_argument("--clear", action="store_true")
+    p.add_argument("--enter", action="store_true")
+    p.set_defaults(func=command_type_text)
+
+    p = sub.add_parser("press-key")
+    add_surface(p)
+    p.add_argument("--key", required=True)
+    p.set_defaults(func=command_press_key)
+
+    p = sub.add_parser("scroll")
+    add_surface(p)
+    p.add_argument("--dx", type=int, default=0)
+    p.add_argument("--dy", type=int, default=0)
+    p.add_argument("--x", type=float)
+    p.add_argument("--y", type=float)
+    p.set_defaults(func=command_scroll)
+
+    p = sub.add_parser("drag")
+    add_surface(p)
+    p.add_argument("--x1", type=float, required=True)
+    p.add_argument("--y1", type=float, required=True)
+    p.add_argument("--x2", type=float, required=True)
+    p.add_argument("--y2", type=float, required=True)
+    p.set_defaults(func=command_drag)
+
+    p = sub.add_parser("wait-for")
+    add_surface(p)
+    add_target(p)
+    p.add_argument("--query", required=True)
+    p.add_argument("--role")
+    p.add_argument("--timeout-ms", type=int, default=10000)
+    p.add_argument("--interval-ms", type=int, default=250)
+    p.set_defaults(func=command_wait_for)
+
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        return args.func(args)
+    except (CliError, subprocess.TimeoutExpired) as exc:
+        print_json({"ok": False, "error": str(exc)})
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

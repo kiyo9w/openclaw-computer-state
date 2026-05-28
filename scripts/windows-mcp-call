@@ -1,0 +1,1544 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+from control_harness import Ledger
+
+WINDOWS_SCRIPT_PATH = r"C:\Users\ngoka\OpenClawTools\windows_mcp_bridge.ps1"
+WINDOWS_SCRIPT_MOUNT = "/mnt/c/Users/ngoka/OpenClawTools/windows_mcp_bridge.ps1"
+POWERSHELL = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+DEFAULT_URL = "http://127.0.0.1:8001/mcp"
+CLIENT_VERSION = "0.5"
+WINDOWS_MCP_EXE = r"C:\Users\ngoka\.local\bin\windows-mcp.exe"
+
+PS_BRIDGE = r'''param(
+  [string]$Mode,
+  [string]$ToolName,
+  [string]$ToolArgsJson,
+  [string]$ToolArgsPath,
+  [string]$Endpoint
+)
+
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$headers = @{Accept='application/json, text/event-stream'; 'Content-Type'='application/json; charset=utf-8'}
+
+function Parse-SseJson([string]$content) {
+  $line = ($content -split "`r?`n") | Where-Object { $_ -like 'data: *' } | Select-Object -First 1
+  if (-not $line) { throw "No data line found in MCP response: $content" }
+  return ($line.Substring(6) | ConvertFrom-Json)
+}
+
+function Send-Mcp([string]$method, [int]$id, $params=$null) {
+  $body = @{jsonrpc='2.0'; id=$id; method=$method}
+  if ($null -ne $params) { $body.params = $params }
+  $json = $body | ConvertTo-Json -Depth 30 -Compress
+  $utf8 = New-Object System.Text.UTF8Encoding($false)
+  $bytes = $utf8.GetBytes($json)
+  return Invoke-WebRequest -UseBasicParsing -Headers $headers -Method POST -Uri $Endpoint -Body $bytes
+}
+
+function Normalize-JsonArg([string]$raw, [string]$path) {
+  if ($path -and $path.Trim() -ne '' -and (Test-Path -LiteralPath $path)) {
+    $raw = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
+  }
+  if (-not $raw -or $raw.Trim() -eq '') { return @{} }
+  $parsed = $raw | ConvertFrom-Json
+  if ($null -eq $parsed) { return @{} }
+  return $parsed
+}
+
+$toolArgs = Normalize-JsonArg $ToolArgsJson $ToolArgsPath
+$initParams = @{protocolVersion='2025-03-26'; capabilities=@{}; clientInfo=@{name='windows-mcp-call'; version='0.5'}}
+$initResp = Send-Mcp 'initialize' 1 $initParams
+$sessionId = $initResp.Headers['mcp-session-id']
+if (-not $sessionId) { throw 'Missing mcp-session-id from initialize response' }
+$headers['mcp-session-id'] = $sessionId
+$notif = @{jsonrpc='2.0'; method='notifications/initialized'} | ConvertTo-Json -Depth 4 -Compress
+Invoke-WebRequest -UseBasicParsing -Headers $headers -Method POST -Uri $Endpoint -Body $notif | Out-Null
+
+$result = [ordered]@{
+  endpoint = $Endpoint
+  sessionId = $sessionId
+  initialize = Parse-SseJson $initResp.Content
+}
+
+if ($Mode -eq 'list-tools') {
+  $listResp = Send-Mcp 'tools/list' 2 @{}
+  $result.call = Parse-SseJson $listResp.Content
+}
+elseif ($Mode -eq 'raw-call') {
+  $callResp = Send-Mcp 'tools/call' 2 @{name=$ToolName; arguments=$toolArgs}
+  $result.call = Parse-SseJson $callResp.Content
+}
+else {
+  throw "Unsupported mode: $Mode"
+}
+
+$result | ConvertTo-Json -Depth 50
+'''
+
+
+class CliError(Exception):
+    pass
+
+
+def ensure_bridge_script() -> None:
+    Path('/mnt/c/Users/ngoka/OpenClawTools').mkdir(parents=True, exist_ok=True)
+    with open(WINDOWS_SCRIPT_MOUNT, 'w', encoding='utf-8', newline='\r\n') as f:
+        f.write(PS_BRIDGE)
+
+
+def decode_output(data: bytes) -> str:
+    for encoding in ('utf-8', 'utf-8-sig', 'cp1252', 'latin-1'):
+        try:
+            text = data.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        text = data.decode('utf-8', errors='replace')
+    return text
+
+
+def repair_mojibake(text: str) -> str:
+    suspects = ('Ã', 'Â', 'â', 'ð')
+    if any(ch in text for ch in suspects):
+        try:
+            repaired = text.encode('latin-1', errors='ignore').decode('utf-8')
+            if repaired:
+                return repaired
+        except Exception:
+            pass
+    return text
+
+
+def run_bridge(mode: str, tool_name: str = '', tool_args: dict[str, Any] | None = None, endpoint: str = DEFAULT_URL) -> dict[str, Any]:
+    ensure_bridge_script()
+    token = uuid.uuid4().hex
+    args_dir_mount = Path(f'/mnt/c/Users/ngoka/OpenClawTools/windows_mcp_args_{token}')
+    args_dir_mount.mkdir(mode=0o700)
+    args_path_mount = args_dir_mount / 'args.json'
+    args_path_win = rf'C:\Users\ngoka\OpenClawTools\windows_mcp_args_{token}\args.json'
+    args_path_mount.write_text(json.dumps(tool_args or {}, ensure_ascii=False), encoding='utf-8')
+    def invoke() -> subprocess.CompletedProcess[bytes]:
+        cmd = [
+            POWERSHELL,
+            '-NoProfile',
+            '-ExecutionPolicy', 'Bypass',
+            '-File', WINDOWS_SCRIPT_PATH,
+            '-Mode', mode,
+            '-ToolName', tool_name,
+            '-ToolArgsJson', '',
+            '-ToolArgsPath', args_path_win,
+            '-Endpoint', endpoint,
+        ]
+        return subprocess.run(cmd, capture_output=True)
+
+    try:
+        proc = invoke()
+        stdout = repair_mojibake(decode_output(proc.stdout))
+        stderr = repair_mojibake(decode_output(proc.stderr))
+        if proc.returncode != 0 and should_autostart_windows_mcp(stderr or stdout):
+            start_windows_mcp(endpoint)
+            proc = invoke()
+            stdout = repair_mojibake(decode_output(proc.stdout))
+            stderr = repair_mojibake(decode_output(proc.stderr))
+        if proc.returncode != 0:
+            raise CliError((stderr or stdout).strip())
+        try:
+            return json.loads(stdout)
+        except json.JSONDecodeError as e:
+            raise CliError(f'Bridge returned invalid JSON: {e}\n--- stdout ---\n{stdout}') from e
+    finally:
+        try:
+            shutil.rmtree(args_dir_mount, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def should_autostart_windows_mcp(message: str) -> bool:
+    if os.environ.get('WINDOWS_MCP_NO_AUTOSTART') == '1':
+        return False
+    lowered = message.lower()
+    return any(token in lowered for token in (
+        'unable to connect to the remote server',
+        'connection refused',
+        'no connection could be made',
+        'actively refused',
+    ))
+
+
+def endpoint_port(endpoint: str) -> int:
+    parsed = urlparse(endpoint)
+    if parsed.port:
+        return parsed.port
+    return 443 if parsed.scheme == 'https' else 80
+
+
+def start_windows_mcp(endpoint: str) -> None:
+    port = str(endpoint_port(endpoint))
+    script = (
+        "$exe = '" + WINDOWS_MCP_EXE + "'; "
+        "if (-not (Test-Path -LiteralPath $exe)) { throw \"windows-mcp.exe not found: $exe\" }; "
+        "$args = @('serve','--transport','streamable-http','--host','127.0.0.1','--port','" + port + "'); "
+        "Start-Process -WindowStyle Hidden -FilePath $exe -ArgumentList $args | Out-Null"
+    )
+    proc = subprocess.run([
+        POWERSHELL,
+        '-NoProfile',
+        '-ExecutionPolicy', 'Bypass',
+        '-Command', script,
+    ], capture_output=True)
+    if proc.returncode != 0:
+        stderr = repair_mojibake(decode_output(proc.stderr))
+        stdout = repair_mojibake(decode_output(proc.stdout))
+        raise CliError(f'Failed to start windows-mcp: {(stderr or stdout).strip()}')
+    wait_windows_mcp_ready(endpoint)
+
+
+def wait_windows_mcp_ready(endpoint: str, timeout_seconds: float = 12.0) -> None:
+    port = str(endpoint_port(endpoint))
+    deadline = time.time() + timeout_seconds
+    script = (
+        "$ok = Test-NetConnection -ComputerName 127.0.0.1 -Port " + port + " -InformationLevel Quiet; "
+        "if ($ok) { exit 0 } else { exit 1 }"
+    )
+    last_error = ''
+    while time.time() < deadline:
+        proc = subprocess.run([
+            POWERSHELL,
+            '-NoProfile',
+            '-ExecutionPolicy', 'Bypass',
+            '-Command', script,
+        ], capture_output=True)
+        if proc.returncode == 0:
+            return
+        last_error = repair_mojibake(decode_output(proc.stderr or proc.stdout))
+        time.sleep(0.4)
+    raise CliError(f'windows-mcp did not become ready on 127.0.0.1:{port} within {timeout_seconds:.0f}s. {last_error.strip()}')
+
+
+def mcp_call(tool: str, args: dict[str, Any], endpoint: str = DEFAULT_URL) -> dict[str, Any]:
+    return run_bridge('raw-call', tool, args, endpoint)
+
+
+def ledger_from_args(args: argparse.Namespace) -> Ledger | None:
+    run_id = getattr(args, 'ledger_run', None) or os.environ.get('CONTROL_LEDGER_RUN')
+    if not run_id:
+        return None
+    return Ledger(run_id=run_id)
+
+
+def log_intent(args: argparse.Namespace, *, intent: str, action: str, payload: dict[str, Any], expected: dict[str, Any] | None = None) -> None:
+    ledger = ledger_from_args(args)
+    if ledger is None:
+        return
+    verification = {
+        'ok': bool(payload.get('ok')),
+        'verified': payload.get('verified'),
+        'verifyInput': payload.get('verifyInput'),
+        'verifySent': payload.get('verifySent'),
+        'verificationScope': payload.get('verificationScope'),
+        'outcomeMatchedLines': payload.get('outcomeMatchedLines'),
+        'sentMatchedLines': payload.get('sentMatchedLines'),
+    }
+    ledger.event(
+        phase='windows-intent',
+        surface='windows-semantic',
+        intent=intent,
+        action=action,
+        expected=expected,
+        result=payload,
+        verification=verification,
+        risk_level=getattr(args, 'risk_level', 'low'),
+        ok=bool(payload.get('ok')),
+    )
+
+
+def log_failure(args: argparse.Namespace, error: Exception) -> None:
+    ledger = ledger_from_args(args)
+    if ledger is None:
+        return
+    attempted_args = {k: v for k, v in vars(args).items() if k != 'func'}
+    ledger.event(
+        phase='windows-intent',
+        surface='windows-semantic',
+        intent=getattr(args, 'command', 'unknown'),
+        action='failed-command',
+        result={'error': str(error), 'args': attempted_args},
+        verification={'ok': False},
+        risk_level=getattr(args, 'risk_level', 'low'),
+        ok=False,
+    )
+
+
+def sensitive_reason(args: argparse.Namespace) -> str | None:
+    command = getattr(args, 'command', '')
+    tool = getattr(args, 'tool', '')
+    normalized_tool = re.sub(r'[^a-z0-9]', '', tool.lower())
+    if command == 'call' and normalized_tool in {'powershell', 'powershellexe', 'registry', 'filesystem'}:
+        return f'raw {args.tool} tool call'
+    if command == 'app' and getattr(args, 'mode', '').lower() == 'launch':
+        return 'app launch'
+    if command == 'process' and getattr(args, 'mode', '') == 'kill':
+        return 'process kill'
+    if command in {'send-composed-message', 'focus-message-box-send'} and getattr(args, 'send', False):
+        return 'message send'
+    return None
+
+
+def enforce_safety_gate(args: argparse.Namespace) -> None:
+    reason = sensitive_reason(args)
+    if reason and not getattr(args, 'allow_sensitive', False):
+        raise CliError(f'Sensitive action blocked ({reason}). Re-run with --allow-sensitive only after explicit approval.')
+
+
+def extract_result_text(payload: dict[str, Any]) -> str:
+    result = payload.get('call', {}).get('result', {})
+    texts: list[str] = []
+    for item in result.get('content', []):
+        if isinstance(item, dict) and item.get('type') == 'text':
+            texts.append(item.get('text', ''))
+    if not texts and isinstance(result.get('structuredContent'), dict):
+        val = result['structuredContent'].get('result')
+        if isinstance(val, str):
+            texts.append(val)
+    return '\n'.join(t for t in texts if t)
+
+
+def extract_snapshot_text(payload: dict[str, Any]) -> str:
+    text = extract_result_text(payload).strip()
+    if text.startswith('["') and text.endswith('"]'):
+        try:
+            decoded = json.loads(text)
+            if isinstance(decoded, list) and decoded and isinstance(decoded[0], str):
+                text = decoded[0]
+        except Exception:
+            pass
+    return sanitize_snapshot_text(text)
+
+
+def sanitize_snapshot_text(text: str) -> str:
+    replacements = {
+        'â”‚': '│',
+        'â”œâ”€â”€': '├──',
+        'â””â”€â”€': '└──',
+        'â”€': '─',
+        'â†’': '→',
+        'â€¦': '…',
+        'ƒ??': '',
+        '�??': '',
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    text = re.sub(r'[\uFFFD]+', '', text)
+    return text
+
+
+def simplify_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    result = payload.get('call', {}).get('result', {})
+    return {
+        'endpoint': payload.get('endpoint'),
+        'sessionId': payload.get('sessionId'),
+        'server': payload.get('initialize', {}).get('result', {}).get('serverInfo', {}),
+        'ok': not bool(result.get('isError')),
+        'text': extract_result_text(payload),
+        'structuredContent': result.get('structuredContent'),
+        'isError': result.get('isError', False),
+    }
+
+
+def parse_json_arg(raw: str | None) -> dict[str, Any]:
+    if raw is None:
+        return {}
+    try:
+        val = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise CliError(f'Invalid JSON args: {e}') from e
+    if not isinstance(val, dict):
+        raise CliError('JSON args must decode to an object')
+    return val
+
+
+def emit_payload(payload: dict[str, Any], output: str, snapshot_mode: bool) -> int:
+    if output == 'json':
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    if output == 'compact':
+        print(json.dumps(simplify_payload(payload), ensure_ascii=False, indent=2))
+        return 0
+    text = extract_snapshot_text(payload) if snapshot_mode else extract_result_text(payload)
+    print(text)
+    result = payload.get('call', {}).get('result', {})
+    return 1 if result.get('isError') else 0
+
+
+def attach_target(tool_args: dict[str, Any], args: argparse.Namespace) -> None:
+    if getattr(args, 'loc', None) is not None:
+        tool_args['loc'] = args.loc
+    elif getattr(args, 'label', None) is not None:
+        tool_args['label'] = args.label
+    else:
+        raise CliError('A target is required: use --loc X Y or --label N')
+
+
+def ensure_ok(payload: dict[str, Any], action: str) -> None:
+    result = payload.get('call', {}).get('result', {})
+    if result.get('isError'):
+        raise CliError(f'{action} failed: {extract_result_text(payload)}')
+
+
+def shortcut(key: str, endpoint: str) -> dict[str, Any]:
+    return mcp_call('Shortcut', {'shortcut': key}, endpoint)
+
+
+def clipboard_get(endpoint: str) -> str:
+    payload = mcp_call('Clipboard', {'mode': 'get'}, endpoint)
+    ensure_ok(payload, 'Clipboard get')
+    text = extract_result_text(payload)
+    prefix = 'Clipboard content:\n'
+    return text[len(prefix):] if text.startswith(prefix) else text
+
+
+def target_dict_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    if getattr(args, 'loc', None) is not None:
+        return {'loc': args.loc}
+    if getattr(args, 'label', None) is not None:
+        return {'label': args.label}
+    raise CliError('A target is required: use --loc X Y or --label N')
+
+
+def snapshot_text(endpoint: str) -> str:
+    payload = mcp_call('Snapshot', {'use_vision': False, 'use_annotation': False, 'use_ui_tree': True}, endpoint)
+    return extract_snapshot_text(payload)
+
+
+def line_indent(line: str) -> int:
+    stripped = line.lstrip(' │├└─\t')
+    return len(line) - len(stripped)
+
+
+def line_loc(line: str) -> list[int] | None:
+    m = re.search(r'\((\d+),(\d+)\)', line)
+    if not m:
+        return None
+    return [int(m.group(1)), int(m.group(2))]
+
+
+def line_has_actionable_fill(line: str) -> bool:
+    return '[action: fill]' in line or '[action: click]' in line
+
+
+def line_control_type(line: str) -> str | None:
+    m = re.search(r'\)\s+([a-z ]+?)\s+"', line)
+    if not m:
+        return None
+    return m.group(1).strip().lower()
+
+
+def line_label(line: str) -> str:
+    m = re.search(r'"([^"]*)"', line)
+    return m.group(1) if m else ''
+
+
+def line_is_focused(line: str) -> bool:
+    return bool(re.search(r'\s\[focused\](?:\s|$)', line))
+
+
+def normalize_window_variants(title: str) -> list[str]:
+    variants = [title]
+    if ' - ' in title:
+        variants.append(title.split(' - ')[-1])
+        variants.append(title.split(' - ')[0])
+    seen: set[str] = set()
+    out: list[str] = []
+    for variant in variants:
+        v = variant.strip()
+        if v and v.lower() not in seen:
+            seen.add(v.lower())
+            out.append(v)
+    return out
+
+
+def collect_window_blocks(text: str) -> list[dict[str, Any]]:
+    lines = text.splitlines()
+    windows: list[dict[str, Any]] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        m = re.search(r'window\s+"([^"]*)"', line, re.IGNORECASE)
+        if m:
+            indent = line_indent(line)
+            block = [line]
+            j = i + 1
+            while j < len(lines):
+                next_line = lines[j]
+                if re.search(r'window\s+"([^"]*)"', next_line, re.IGNORECASE) and line_indent(next_line) <= indent:
+                    break
+                block.append(next_line)
+                j += 1
+            windows.append({'title': m.group(1), 'line': line, 'block': block, 'source': 'ui-tree'})
+            i = j
+            continue
+        i += 1
+    return windows
+
+
+def collect_opened_windows(text: str) -> list[dict[str, Any]]:
+    lines = text.splitlines()
+    windows: list[dict[str, Any]] = []
+    in_section = False
+    for line in lines:
+        if 'Opened Windows:' in line:
+            in_section = True
+            continue
+        if in_section:
+            if not line.strip():
+                break
+            if line.strip().startswith('Name') or set(line.strip()) <= {'-', ' '}:
+                continue
+            m = re.match(r'(.+?)\s{2,}\d+\s{2,}(?:Normal|Maximized|Minimized)\s+', line)
+            if m:
+                title = m.group(1).strip()
+                if title:
+                    windows.append({'title': title, 'line': line, 'block': [line], 'source': 'opened-windows'})
+    return windows
+
+
+def score_window(title: str, pattern: re.Pattern[str]) -> int:
+    score = 0
+    if pattern.search(title):
+        score += 100
+    lower = title.lower()
+    pat = pattern.pattern.lower()
+    if pat in lower:
+        score += 50
+    if lower.startswith(pat):
+        score += 10
+    return score
+
+
+def find_window_match(text: str, pattern_text: str, case_sensitive: bool = False) -> dict[str, Any]:
+    flags = 0 if case_sensitive else re.IGNORECASE
+    pattern = re.compile(pattern_text, flags)
+    windows = collect_opened_windows(text) + collect_window_blocks(text)
+    matches = []
+    for win in windows:
+        score = score_window(win['title'], pattern)
+        if score > 0:
+            matches.append({**win, 'score': score})
+    if not matches:
+        raise CliError(f'No window matched pattern: {pattern_text}')
+    matches.sort(key=lambda x: (-x['score'], 0 if x.get('source') == 'opened-windows' else 1, len(x['title'])))
+    return matches[0]
+
+
+def find_clickable_taskbar_loc(text: str, title: str) -> list[int] | None:
+    patterns = [re.compile(re.escape(v), re.IGNORECASE) for v in normalize_window_variants(title)]
+    for line in text.splitlines():
+        if 'button ' in line and 'running window' in line:
+            for pattern in patterns:
+                if pattern.search(line):
+                    loc = line_loc(line)
+                    if loc:
+                        return loc
+    for line in text.splitlines():
+        if 'list item ' in line or 'button ' in line:
+            for pattern in patterns:
+                if pattern.search(line):
+                    loc = line_loc(line)
+                    if loc:
+                        return loc
+    return None
+
+
+def find_focused_target(text: str, control_types: list[str] | None = None) -> dict[str, Any] | None:
+    allowed = {c.lower() for c in control_types} if control_types else None
+    for line in text.splitlines():
+        if not line_is_focused(line):
+            continue
+        ctype = line_control_type(line)
+        if allowed and ctype not in allowed:
+            continue
+        loc = line_loc(line)
+        if loc:
+            return {'loc': loc, 'source': 'focused', 'matched_line': line, 'control_type': ctype, 'label': line_label(line)}
+    return None
+
+
+def is_viable_loc(loc: list[int] | None) -> bool:
+    return bool(loc) and not (loc[0] == 0 and loc[1] == 0)
+
+
+def find_pattern_target(text: str, pattern_text: str, case_sensitive: bool = False, control_types: list[str] | None = None) -> dict[str, Any] | None:
+    flags = 0 if case_sensitive else re.IGNORECASE
+    pattern = re.compile(pattern_text, flags)
+    allowed = {c.lower() for c in control_types} if control_types else None
+    for line in text.splitlines():
+        if not pattern.search(line):
+            continue
+        ctype = line_control_type(line)
+        if allowed and ctype not in allowed:
+            continue
+        loc = line_loc(line)
+        if is_viable_loc(loc):
+            return {'loc': loc, 'source': 'snapshot-pattern', 'matched_line': line, 'control_type': ctype, 'label': line_label(line)}
+    return None
+
+
+def find_window_block_by_title(text: str, title: str) -> dict[str, Any] | None:
+    variants = normalize_window_variants(title)
+    for win in collect_window_blocks(text):
+        for variant in variants:
+            if variant.lower() == (win.get('title') or '').lower():
+                return win
+            if variant.lower() in (win.get('title') or '').lower():
+                return win
+    return None
+
+
+def find_window_entry_by_title(text: str, title: str) -> dict[str, Any] | None:
+    variants = normalize_window_variants(title)
+    for win in collect_opened_windows(text) + collect_window_blocks(text):
+        win_title = (win.get('title') or '').lower()
+        for variant in variants:
+            v = variant.lower()
+            if v == win_title or v in win_title:
+                return win
+    return None
+
+
+def find_target_in_window_block(text: str, window_title: str, pattern_text: str | None = None, control_types: list[str] | None = None, prefer_focused: bool = True, case_sensitive: bool = False) -> dict[str, Any] | None:
+    win = find_window_block_by_title(text, window_title)
+    if not win:
+        return None
+    block_lines = win['block']
+    allowed = {c.lower() for c in control_types} if control_types else None
+    if prefer_focused:
+        for line in block_lines:
+            if not line_is_focused(line):
+                continue
+            ctype = line_control_type(line)
+            if allowed and ctype not in allowed:
+                continue
+            loc = line_loc(line)
+            if is_viable_loc(loc):
+                return {'loc': loc, 'source': 'window-focused', 'matched_line': line, 'window': window_title, 'control_type': ctype, 'label': line_label(line)}
+    if pattern_text:
+        flags = 0 if case_sensitive else re.IGNORECASE
+        pattern = re.compile(pattern_text, flags)
+        for line in block_lines:
+            if not pattern.search(line):
+                continue
+            ctype = line_control_type(line)
+            if allowed and ctype not in allowed:
+                continue
+            loc = line_loc(line)
+            if is_viable_loc(loc):
+                return {'loc': loc, 'source': 'window-pattern', 'matched_line': line, 'window': window_title, 'control_type': ctype, 'label': line_label(line)}
+    if allowed:
+        for line in block_lines:
+            ctype = line_control_type(line)
+            if ctype not in allowed:
+                continue
+            loc = line_loc(line)
+            if is_viable_loc(loc):
+                return {'loc': loc, 'source': 'window-first-control', 'matched_line': line, 'window': window_title, 'control_type': ctype, 'label': line_label(line)}
+    return None
+
+
+def heuristic_editor_target(window_title: str) -> dict[str, Any] | None:
+    lower = window_title.lower()
+    if 'notepad' in lower:
+        return {'loc': [800, 500], 'source': 'heuristic-notepad-editor'}
+    return None
+
+
+def is_editor_family_window(title: str) -> bool:
+    lower = title.lower()
+    return any(token in lower for token in ('notepad', 'editor', '.txt'))
+
+
+def focused_window_title(text: str) -> str | None:
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if 'Focused Window:' in line:
+            for nxt in lines[i + 1:]:
+                s = nxt.strip()
+                if not s:
+                    break
+                if s.startswith('Name') or set(s) <= {'-', ' '}:
+                    continue
+                m = re.match(r'(.+?)\s{2,}\d+\s{2,}(?:Normal|Maximized|Minimized)\s+', nxt)
+                if m:
+                    return m.group(1).strip()
+    return None
+
+
+def title_matches_pattern(title: str | None, pattern_text: str, case_sensitive: bool = False) -> bool:
+    if not title:
+        return False
+    flags = 0 if case_sensitive else re.IGNORECASE
+    return re.search(pattern_text, title, flags) is not None
+
+
+def focus_window_by_pattern(pattern_text: str, endpoint: str, case_sensitive: bool = False) -> dict[str, Any]:
+    text = snapshot_text(endpoint)
+    win = find_window_match(text, pattern_text, case_sensitive=case_sensitive)
+    loc = find_clickable_taskbar_loc(text, win['title'])
+    if not loc:
+        raise CliError(f'Matched window "{win["title"]}" but found no clickable taskbar/list target')
+    click_payload = mcp_call('Click', {'loc': loc, 'button': 'left', 'clicks': 1}, endpoint)
+    ensure_ok(click_payload, f'Focus window {win["title"]}')
+    return {
+        'window': win['title'],
+        'loc': loc,
+        'click': extract_result_text(click_payload),
+        'snapshot_match': win['line'],
+    }
+
+
+def choose_target(args: argparse.Namespace, endpoint: str) -> dict[str, Any]:
+    if getattr(args, 'loc', None) is not None:
+        return {'loc': args.loc, 'source': 'loc'}
+    if getattr(args, 'label', None) is not None:
+        return {'label': args.label, 'source': 'label'}
+
+    text = snapshot_text(endpoint)
+    control_types = getattr(args, 'control_type', None)
+    if isinstance(control_types, str):
+        control_types = [control_types]
+
+    if getattr(args, 'prefer_focused', False):
+        focused = find_focused_target(text, control_types=control_types)
+        if focused:
+            return focused
+
+    target_pattern = getattr(args, 'target_pattern', None)
+    window_title = getattr(args, 'window_title', None)
+    case_sensitive = getattr(args, 'case_sensitive', False)
+
+    if window_title:
+        scoped = find_target_in_window_block(
+            text,
+            window_title=window_title,
+            pattern_text=target_pattern,
+            control_types=control_types,
+            prefer_focused=getattr(args, 'prefer_focused', False),
+            case_sensitive=case_sensitive,
+        )
+        if scoped:
+            return scoped
+        heuristic = heuristic_editor_target(window_title)
+        if heuristic:
+            return heuristic
+
+    if target_pattern:
+        matched = find_pattern_target(text, target_pattern, case_sensitive=case_sensitive, control_types=control_types)
+        if matched:
+            return matched
+        raise CliError(f'No clickable target matched pattern: {target_pattern}')
+
+    if getattr(args, 'prefer_focused', False):
+        focused_any = find_focused_target(text, control_types=control_types)
+        if focused_any:
+            return focused_any
+
+    raise CliError('A target is required: use --loc X Y, --label N, --target-pattern REGEX, or enable --prefer-focused')
+
+
+def cmd_call(args: argparse.Namespace) -> int:
+    payload = run_bridge('raw-call', args.tool, parse_json_arg(args.args), args.endpoint)
+    return emit_payload(payload, args.output, snapshot_mode=(args.tool.lower() == 'snapshot'))
+
+
+def cmd_tools(args: argparse.Namespace) -> int:
+    payload = run_bridge('list-tools', endpoint=args.endpoint)
+    if args.output == 'json':
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    tools = payload.get('call', {}).get('result', {}).get('tools', [])
+    if args.output == 'names':
+        for tool in tools:
+            print(tool.get('name', ''))
+        return 0
+    for tool in tools:
+        name = tool.get('name', '')
+        desc = (tool.get('description', '') or '').strip().replace('\n', ' ')
+        print(f'- {name}: {desc}')
+    return 0
+
+
+def cmd_snapshot(args: argparse.Namespace) -> int:
+    tool_args = {
+        'use_vision': args.vision,
+        'use_annotation': args.annotation,
+        'use_ui_tree': not args.no_ui_tree,
+    }
+    if args.display:
+        tool_args['display'] = args.display
+    payload = mcp_call('Snapshot', tool_args, args.endpoint)
+    return emit_payload(payload, args.output, snapshot_mode=True)
+
+
+def cmd_screenshot(args: argparse.Namespace) -> int:
+    tool_args = {'use_annotation': args.annotation}
+    if args.display:
+        tool_args['display'] = args.display
+    payload = mcp_call('Screenshot', tool_args, args.endpoint)
+    return emit_payload(payload, args.output, snapshot_mode=False)
+
+
+def cmd_snapshot_find(args: argparse.Namespace) -> int:
+    payload = mcp_call('Snapshot', {'use_vision': False, 'use_annotation': False, 'use_ui_tree': True}, args.endpoint)
+    text = extract_snapshot_text(payload)
+    flags = re.IGNORECASE if not args.case_sensitive else 0
+    pattern = re.compile(args.pattern, flags)
+    matches = [line for line in text.splitlines() if pattern.search(line)]
+    if args.output == 'json':
+        print(json.dumps({'pattern': args.pattern, 'matches': matches}, ensure_ascii=False, indent=2))
+        return 0 if matches else 1
+    print('\n'.join(matches[: args.limit]))
+    return 0 if matches else 1
+
+
+def cmd_window_find(args: argparse.Namespace) -> int:
+    text = snapshot_text(args.endpoint)
+    win = find_window_match(text, args.pattern, case_sensitive=args.case_sensitive)
+    loc = find_clickable_taskbar_loc(text, win['title'])
+    payload = {
+        'pattern': args.pattern,
+        'window': win['title'],
+        'score': win['score'],
+        'taskbarLoc': loc,
+        'snapshotLine': win['line'],
+        'block': win['block'],
+    }
+    if args.output == 'json':
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print(f'Window: {win["title"]}')
+        if loc:
+            print(f'Taskbar/list target: ({loc[0]},{loc[1]})')
+        print(win['line'])
+    return 0
+
+
+def cmd_focus_window(args: argparse.Namespace) -> int:
+    result = focus_window_by_pattern(args.pattern, args.endpoint, case_sensitive=args.case_sensitive)
+    if args.output == 'json':
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    elif args.output == 'compact':
+        print(json.dumps({'window': result['window'], 'loc': result['loc']}, ensure_ascii=False, indent=2))
+    else:
+        print(f'Focused window {result["window"]} via ({result["loc"][0]},{result["loc"][1]}).')
+    return 0
+
+
+def cmd_clipboard(args: argparse.Namespace) -> int:
+    tool_args: dict[str, Any] = {'mode': 'set' if args.set is not None else 'get'}
+    if args.set is not None:
+        tool_args['text'] = args.set
+    payload = mcp_call('Clipboard', tool_args, args.endpoint)
+    return emit_payload(payload, args.output, snapshot_mode=False)
+
+
+def cmd_app(args: argparse.Namespace) -> int:
+    tool_args: dict[str, Any] = {'mode': args.mode}
+    if args.name is not None:
+        tool_args['name'] = args.name
+    if args.window_loc is not None:
+        tool_args['window_loc'] = args.window_loc
+    if args.window_size is not None:
+        tool_args['window_size'] = args.window_size
+    payload = mcp_call('App', tool_args, args.endpoint)
+    return emit_payload(payload, args.output, snapshot_mode=False)
+
+
+def cmd_type(args: argparse.Namespace) -> int:
+    tool_args: dict[str, Any] = {'text': args.text, 'clear': args.clear, 'press_enter': args.enter}
+    attach_target(tool_args, args)
+    payload = mcp_call('Type', tool_args, args.endpoint)
+    return emit_payload(payload, args.output, snapshot_mode=False)
+
+
+def cmd_click(args: argparse.Namespace) -> int:
+    tool_args: dict[str, Any] = {'button': args.button, 'clicks': args.clicks}
+    attach_target(tool_args, args)
+    payload = mcp_call('Click', tool_args, args.endpoint)
+    return emit_payload(payload, args.output, snapshot_mode=False)
+
+
+def cmd_shortcut(args: argparse.Namespace) -> int:
+    payload = shortcut(args.shortcut, args.endpoint)
+    return emit_payload(payload, args.output, snapshot_mode=False)
+
+
+def cmd_process(args: argparse.Namespace) -> int:
+    tool_args: dict[str, Any] = {'mode': args.mode, 'sort_by': args.sort_by, 'limit': args.limit, 'force': args.force}
+    if args.name is not None:
+        tool_args['name'] = args.name
+    if args.pid is not None:
+        tool_args['pid'] = args.pid
+    payload = mcp_call('Process', tool_args, args.endpoint)
+    return emit_payload(payload, args.output, snapshot_mode=False)
+
+
+def actionable_target_fields(target: dict[str, Any]) -> dict[str, Any]:
+    fields: dict[str, Any] = {}
+    if isinstance(target.get('loc'), list):
+        fields['loc'] = target['loc']
+    if isinstance(target.get('label'), int):
+        fields['label'] = target['label']
+    return fields
+
+
+def cmd_write_verify(args: argparse.Namespace) -> int:
+    target = choose_target(args, args.endpoint)
+    steps: list[dict[str, Any]] = []
+
+    click_payload = mcp_call('Click', actionable_target_fields(target) | {'button': 'left', 'clicks': 1}, args.endpoint)
+    ensure_ok(click_payload, 'Click target')
+    steps.append({'step': 'click', 'text': extract_result_text(click_payload), 'target': target})
+
+    if args.clear or args.verify:
+        select_payload = shortcut('ctrl+a', args.endpoint)
+        ensure_ok(select_payload, 'Select all shortcut')
+        steps.append({'step': 'select_all_before_input', 'text': extract_result_text(select_payload)})
+
+    if args.method == 'paste':
+        clip_set = mcp_call('Clipboard', {'mode': 'set', 'text': args.text}, args.endpoint)
+        ensure_ok(clip_set, 'Clipboard set')
+        steps.append({'step': 'clipboard_set', 'text': extract_result_text(clip_set)})
+        paste_payload = shortcut('ctrl+v', args.endpoint)
+        ensure_ok(paste_payload, 'Paste shortcut')
+        steps.append({'step': 'paste', 'text': extract_result_text(paste_payload)})
+    else:
+        type_args = actionable_target_fields(target) | {'text': args.text, 'clear': args.clear, 'press_enter': args.enter}
+        type_payload = mcp_call('Type', type_args, args.endpoint)
+        ensure_ok(type_payload, 'Type text')
+        steps.append({'step': 'type', 'text': extract_result_text(type_payload)})
+
+    verify_value = None
+    if args.verify:
+        ensure_ok(shortcut('ctrl+a', args.endpoint), 'Select all shortcut')
+        ensure_ok(shortcut('ctrl+c', args.endpoint), 'Copy shortcut')
+        verify_value = clipboard_get(args.endpoint)
+        if verify_value != args.text:
+            raise CliError(f'Verification mismatch. expected={args.text!r} actual={verify_value!r}')
+        steps.append({'step': 'verify_clipboard', 'text': verify_value})
+
+    payload = {
+        'ok': True,
+        'method': args.method,
+        'verified': bool(args.verify),
+        'text': args.text,
+        'clipboard': verify_value,
+        'target': target,
+        'steps': steps,
+    }
+    log_intent(args, intent='write-verify', action='write text and optionally verify clipboard', payload=payload, expected={'text': args.text, 'verify': bool(args.verify)})
+    if args.output == 'json':
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif args.output == 'compact':
+        print(json.dumps({'ok': True, 'verified': bool(args.verify), 'method': args.method, 'text': args.text, 'target': target}, ensure_ascii=False, indent=2))
+    else:
+        print(f"Wrote text via {args.method}." + (" Verification passed." if args.verify else ""))
+    return 0
+
+
+def cmd_resolve_target(args: argparse.Namespace) -> int:
+    target_ns = argparse.Namespace(
+        loc=args.loc,
+        label=args.label,
+        target_pattern=args.target_pattern,
+        case_sensitive=args.case_sensitive,
+        endpoint=args.endpoint,
+        prefer_focused=args.prefer_focused,
+        control_type=args.control_type,
+        window_title=args.window,
+    )
+    target = choose_target(target_ns, args.endpoint)
+    if args.output == 'json':
+        print(json.dumps(target, ensure_ascii=False, indent=2))
+    else:
+        print(json.dumps(target, ensure_ascii=False))
+    return 0
+
+
+def run_focus_address_bar_open(window: str, url: str, endpoint: str, case_sensitive: bool = False, verify: bool = False) -> dict[str, Any]:
+    focus = focus_window_by_pattern(window, endpoint, case_sensitive=case_sensitive)
+    steps = [{'step': 'focus_window', 'window': focus['window'], 'loc': focus['loc'], 'snapshot_match': focus['snapshot_match']}]
+
+    pinned = False
+    pin_last = None
+    for attempt in range(1, 4):
+        select_address = shortcut('ctrl+l', endpoint)
+        ensure_ok(select_address, 'Focus address bar shortcut')
+        steps.append({'step': 'focus_address_bar', 'attempt': attempt, 'text': extract_result_text(select_address)})
+
+        ensure_ok(shortcut('ctrl+c', endpoint), 'Copy address bar shortcut')
+        pin_last = clipboard_get(endpoint)
+        steps.append({'step': 'address_bar_probe', 'attempt': attempt, 'text': pin_last})
+        if pin_last.startswith('http://') or pin_last.startswith('https://') or pin_last.startswith('chrome://'):
+            pinned = True
+            break
+
+        focus = focus_window_by_pattern(window, endpoint, case_sensitive=case_sensitive)
+        steps.append({'step': 'refocus_window', 'attempt': attempt, 'window': focus['window'], 'loc': focus['loc']})
+
+    if not pinned:
+        raise CliError(f'Failed to pin browser address bar; last clipboard probe was {pin_last!r}')
+
+    ensure_ok(shortcut('ctrl+a', endpoint), 'Select all shortcut')
+    steps.append({'step': 'select_all_before_input', 'text': 'Pressed ctrl+a.'})
+
+    clip_set = mcp_call('Clipboard', {'mode': 'set', 'text': url}, endpoint)
+    ensure_ok(clip_set, 'Clipboard set')
+    steps.append({'step': 'clipboard_set', 'text': extract_result_text(clip_set)})
+
+    paste_payload = shortcut('ctrl+v', endpoint)
+    ensure_ok(paste_payload, 'Paste shortcut')
+    steps.append({'step': 'paste', 'text': extract_result_text(paste_payload)})
+
+    if verify:
+        ensure_ok(shortcut('ctrl+a', endpoint), 'Select all shortcut')
+        ensure_ok(shortcut('ctrl+c', endpoint), 'Copy shortcut')
+        verify_value = clipboard_get(endpoint)
+        expected = url.rstrip('/')
+        actual = verify_value.rstrip('/')
+        if actual != expected:
+            raise CliError(f'Address bar verification mismatch. expected={url!r} actual={verify_value!r}')
+        steps.append({'step': 'verify_clipboard', 'text': verify_value})
+    else:
+        verify_value = None
+
+    open_payload = shortcut('enter', endpoint)
+    ensure_ok(open_payload, 'Open URL shortcut')
+    steps.append({'step': 'open_url', 'text': extract_result_text(open_payload)})
+
+    return {
+        'ok': True,
+        'window': focus['window'],
+        'url': url,
+        'verified': bool(verify),
+        'clipboard': verify_value,
+        'steps': steps,
+    }
+
+
+def cmd_focus_address_bar_open(args: argparse.Namespace) -> int:
+    payload = run_focus_address_bar_open(args.window, args.url, args.endpoint, case_sensitive=args.case_sensitive, verify=args.verify)
+    log_intent(args, intent='focus-address-bar-open', action='focus browser address bar and open URL', payload=payload, expected={'url': args.url, 'verify': bool(args.verify)})
+    if args.output == 'json':
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif args.output == 'compact':
+        print(json.dumps({'ok': True, 'window': payload['window'], 'url': args.url, 'verified': bool(args.verify)}, ensure_ascii=False, indent=2))
+    else:
+        print(f'Focused {payload["window"]} and opened URL.' + (' Verification passed.' if args.verify else ''))
+    return 0
+
+
+def run_open_resource(window: str, resource: str, expect: str, endpoint: str, case_sensitive: bool = False, verify_input: bool = False) -> dict[str, Any]:
+    payload = run_focus_address_bar_open(window, resource, endpoint, case_sensitive=case_sensitive, verify=verify_input)
+    flags = 0 if case_sensitive else re.IGNORECASE
+    pattern = re.compile(expect, flags)
+
+    matched_lines: list[str] = []
+    verified_window = payload['window']
+    verification_scope = 'global snapshot'
+    last_snapshot = ''
+    for attempt in range(1, 5):
+        if attempt > 1:
+            time.sleep(0.6)
+        text = snapshot_text(endpoint)
+        last_snapshot = text
+        win = find_window_entry_by_title(text, payload['window'])
+        search_lines = win['block'] if win else []
+        if not search_lines and not is_browser_family_window(payload['window']):
+            search_lines = text.splitlines()
+        matched_lines = [line for line in search_lines if pattern.search(line)]
+        if matched_lines:
+            verified_window = win['title'] if win else payload['window']
+            verification_scope = verified_window if win else 'global snapshot'
+            payload.setdefault('steps', []).append({'step': 'verify_outcome', 'attempt': attempt, 'scope': verification_scope, 'matched': matched_lines[:3]})
+            break
+    if not matched_lines:
+        raise CliError(f'Open-resource verification failed after settle retries: pattern {expect!r} not found in the focused browser/app family')
+    payload['intent'] = 'open-resource'
+    payload['resource'] = resource
+    payload['expect'] = expect
+    payload['focusedWindow'] = payload['window']
+    payload['verifiedWindow'] = verified_window
+    payload['verificationScope'] = verification_scope
+    payload['outcomeMatchedLines'] = matched_lines[:10]
+    return payload
+
+
+def cmd_focus_open_verify(args: argparse.Namespace) -> int:
+    payload = run_open_resource(args.window, args.url, args.expect, args.endpoint, case_sensitive=args.case_sensitive, verify_input=args.verify_address)
+    log_intent(args, intent='focus-open-verify', action='open URL and verify outcome pattern', payload=payload, expected={'url': args.url, 'expect': args.expect})
+    if args.output == 'json':
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif args.output == 'compact':
+        print(json.dumps({'ok': True, 'focusedWindow': payload['focusedWindow'], 'verifiedWindow': payload['verifiedWindow'], 'url': payload['url'], 'expect': args.expect}, ensure_ascii=False, indent=2))
+    else:
+        print(f'Opened {payload["url"]} and verified outcome pattern.')
+    return 0
+
+
+def is_browser_family_window(title: str) -> bool:
+    lower = title.lower()
+    return any(token in lower for token in ('brave', 'chrome', 'edge', 'duckduckgo', 'browser'))
+
+
+def browser_family_pattern(title: str) -> str | None:
+    lower = title.lower()
+    if 'brave' in lower:
+        return r'Brave'
+    if 'chrome' in lower:
+        return r'Chrome|Google Chrome'
+    if 'edge' in lower:
+        return r'Edge|Microsoft Edge'
+    if 'duckduckgo' in lower:
+        return r'DuckDuckGo'
+    return None
+
+
+def run_send_composed_message(window: str, text_value: str, endpoint: str, target_pattern: str = 'Message', case_sensitive: bool = False, verify_input: bool = False, send: bool = False, verify_sent: bool = False, adapter: str = 'auto') -> dict[str, Any]:
+    focus = focus_window_by_pattern(window, endpoint, case_sensitive=case_sensitive)
+    steps = [{'step': 'focus_window', 'window': focus['window'], 'loc': focus['loc'], 'snapshot_match': focus['snapshot_match']}]
+
+    adapter_used = adapter
+    target = None
+    if adapter == 'browser-search' or (adapter == 'auto' and is_browser_family_window(focus['window']) and re.search(r'search|address', target_pattern, re.IGNORECASE)):
+        adapter_used = 'browser-search'
+        shortcut_payload = shortcut('ctrl+l', endpoint)
+        ensure_ok(shortcut_payload, 'Browser search/navigation shortcut')
+        steps.append({'step': 'focus_browser_search_surface', 'text': extract_result_text(shortcut_payload)})
+    else:
+        adapter_used = 'generic-edit'
+        target_ns = argparse.Namespace(
+            loc=None,
+            label=None,
+            target_pattern=target_pattern,
+            case_sensitive=case_sensitive,
+            endpoint=endpoint,
+            prefer_focused=True,
+            control_type=['edit'],
+            window_title=focus['window'],
+        )
+        target = choose_target(target_ns, endpoint)
+        if is_editor_family_window(focus['window']):
+            refocus = focus_window_by_pattern(window, endpoint, case_sensitive=case_sensitive)
+            steps.append({'step': 'refocus_editor_window', 'window': refocus['window'], 'loc': refocus['loc']})
+        click_payload = mcp_call('Click', actionable_target_fields(target) | {'button': 'left', 'clicks': 1}, endpoint)
+        ensure_ok(click_payload, 'Click composition surface target')
+        steps.append({'step': 'click_composition_surface', 'text': extract_result_text(click_payload), 'target': target})
+
+    ensure_ok(shortcut('ctrl+a', endpoint), 'Select all shortcut')
+    steps.append({'step': 'select_all_before_input', 'text': 'Pressed ctrl+a.'})
+
+    clip_set = mcp_call('Clipboard', {'mode': 'set', 'text': text_value}, endpoint)
+    ensure_ok(clip_set, 'Clipboard set')
+    steps.append({'step': 'clipboard_set', 'text': extract_result_text(clip_set)})
+
+    paste_payload = shortcut('ctrl+v', endpoint)
+    ensure_ok(paste_payload, 'Paste shortcut')
+    steps.append({'step': 'paste', 'text': extract_result_text(paste_payload)})
+
+    if verify_input:
+        if adapter_used == 'generic-edit' and target is not None:
+            reanchor_payload = mcp_call('Click', actionable_target_fields(target) | {'button': 'left', 'clicks': 1}, endpoint)
+            ensure_ok(reanchor_payload, 'Re-anchor composition surface target')
+            steps.append({'step': 'reanchor_composition_surface', 'text': extract_result_text(reanchor_payload), 'target': target})
+        ensure_ok(shortcut('ctrl+a', endpoint), 'Select all shortcut')
+        ensure_ok(shortcut('ctrl+c', endpoint), 'Copy shortcut')
+        verify_value = clipboard_get(endpoint)
+        if verify_value != text_value:
+            raise CliError(f'Composition-surface verification mismatch. expected={text_value!r} actual={verify_value!r}')
+        steps.append({'step': 'verify_input_clipboard', 'text': verify_value})
+    else:
+        verify_value = None
+
+    if send:
+        send_payload = shortcut('enter', endpoint)
+        ensure_ok(send_payload, 'Send message shortcut')
+        steps.append({'step': 'send_message', 'text': extract_result_text(send_payload)})
+
+    text = snapshot_text(endpoint)
+    flags = 0 if case_sensitive else re.IGNORECASE
+    pattern = re.compile(re.escape(text_value), flags)
+    win = find_window_block_by_title(text, focus['window'])
+    search_lines = win['block'] if win else text.splitlines()
+    matched_lines = [line for line in search_lines if pattern.search(line)]
+    if verify_sent and not matched_lines:
+        scope = focus['window'] if win else 'global snapshot'
+        raise CliError(f'Composed-message verification failed: text not found in {scope} after send')
+
+    return {
+        'ok': True,
+        'intent': 'send-composed-message',
+        'window': focus['window'],
+        'text': text_value,
+        'target': target,
+        'adapter': adapter_used,
+        'verifyInput': bool(verify_input),
+        'verifySent': bool(verify_sent),
+        'sentMatchedLines': matched_lines[:10],
+        'verificationScope': focus['window'] if win else 'global snapshot',
+        'clipboard': verify_value,
+        'steps': steps,
+    }
+
+
+def cmd_focus_message_box_send(args: argparse.Namespace) -> int:
+    payload = run_send_composed_message(args.window, args.text, args.endpoint, target_pattern=args.target_pattern, case_sensitive=args.case_sensitive, verify_input=args.verify_input, send=args.send, verify_sent=args.verify_sent)
+    log_intent(args, intent='focus-message-box-send', action='compose message and optionally send', payload=payload, expected={'text': args.text, 'send': bool(args.send), 'verifySent': bool(args.verify_sent)})
+    if args.output == 'json':
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif args.output == 'compact':
+        print(json.dumps({'ok': True, 'window': payload['window'], 'verifySent': bool(args.verify_sent)}, ensure_ascii=False, indent=2))
+    else:
+        print('Focused message box and sent message.' if args.send else 'Focused message box and filled message.')
+    return 0
+
+
+def cmd_open_resource(args: argparse.Namespace) -> int:
+    payload = run_open_resource(args.window, args.resource, args.expect, args.endpoint, case_sensitive=args.case_sensitive, verify_input=args.verify_input)
+    log_intent(args, intent='open-resource', action='open resource and verify outcome pattern', payload=payload, expected={'resource': args.resource, 'expect': args.expect})
+    if args.output == 'json':
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif args.output == 'compact':
+        print(json.dumps({'ok': True, 'intent': payload['intent'], 'focusedWindow': payload['focusedWindow'], 'verifiedWindow': payload['verifiedWindow'], 'resource': payload['resource'], 'expect': payload['expect']}, ensure_ascii=False, indent=2))
+    else:
+        print(f'Opened resource {payload["resource"]} and verified outcome.')
+    return 0
+
+
+def cmd_send_composed_message(args: argparse.Namespace) -> int:
+    payload = run_send_composed_message(args.window, args.text, args.endpoint, target_pattern=args.target_pattern, case_sensitive=args.case_sensitive, verify_input=args.verify_input, send=args.send, verify_sent=args.verify_sent, adapter=args.adapter)
+    log_intent(args, intent='send-composed-message', action='compose message and optionally send', payload=payload, expected={'text': args.text, 'send': bool(args.send), 'verifySent': bool(args.verify_sent)})
+    if args.output == 'json':
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif args.output == 'compact':
+        print(json.dumps({'ok': True, 'intent': payload['intent'], 'window': payload['window'], 'verifySent': payload['verifySent']}, ensure_ascii=False, indent=2))
+    else:
+        print('Composed and sent message.' if args.send else 'Composed message.')
+    return 0
+
+
+def cmd_fill_search_surface(args: argparse.Namespace) -> int:
+    payload = run_send_composed_message(args.window, args.query, args.endpoint, target_pattern=args.target_pattern, case_sensitive=args.case_sensitive, verify_input=args.verify_input, send=False, verify_sent=False, adapter=args.adapter)
+    payload['intent'] = 'fill-search-surface'
+    payload['query'] = args.query
+    log_intent(args, intent='fill-search-surface', action='fill search-like surface', payload=payload, expected={'query': args.query, 'verifyInput': bool(args.verify_input)})
+    if args.output == 'json':
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif args.output == 'compact':
+        print(json.dumps({'ok': True, 'intent': payload['intent'], 'window': payload['window'], 'query': args.query}, ensure_ascii=False, indent=2))
+    else:
+        print('Filled search surface.')
+    return 0
+
+
+def cmd_focus_write_verify(args: argparse.Namespace) -> int:
+    focus = focus_window_by_pattern(args.window, args.endpoint, case_sensitive=args.case_sensitive)
+    target_ns = argparse.Namespace(
+        loc=args.loc,
+        label=args.label,
+        target_pattern=args.target_pattern,
+        case_sensitive=args.case_sensitive,
+        endpoint=args.endpoint,
+        text=args.text,
+        method=args.method,
+        clear=args.clear,
+        enter=args.enter,
+        verify=args.verify,
+        output='json',
+        prefer_focused=args.prefer_focused,
+        control_type=args.control_type,
+        window_title=focus['window'],
+    )
+    target = choose_target(target_ns, args.endpoint)
+
+    steps = [{'step': 'focus_window', 'window': focus['window'], 'loc': focus['loc'], 'snapshot_match': focus['snapshot_match']}]
+
+    click_payload = mcp_call('Click', actionable_target_fields(target) | {'button': 'left', 'clicks': 1}, args.endpoint)
+    ensure_ok(click_payload, 'Click target')
+    steps.append({'step': 'click_target', 'text': extract_result_text(click_payload), 'target': target})
+
+    if args.clear or args.verify:
+        select_payload = shortcut('ctrl+a', args.endpoint)
+        ensure_ok(select_payload, 'Select all shortcut')
+        steps.append({'step': 'select_all_before_input', 'text': extract_result_text(select_payload)})
+
+    if args.method == 'paste':
+        clip_set = mcp_call('Clipboard', {'mode': 'set', 'text': args.text}, args.endpoint)
+        ensure_ok(clip_set, 'Clipboard set')
+        steps.append({'step': 'clipboard_set', 'text': extract_result_text(clip_set)})
+        paste_payload = shortcut('ctrl+v', args.endpoint)
+        ensure_ok(paste_payload, 'Paste shortcut')
+        steps.append({'step': 'paste', 'text': extract_result_text(paste_payload)})
+    else:
+        type_payload = mcp_call('Type', actionable_target_fields(target) | {'text': args.text, 'clear': args.clear, 'press_enter': args.enter}, args.endpoint)
+        ensure_ok(type_payload, 'Type text')
+        steps.append({'step': 'type', 'text': extract_result_text(type_payload)})
+
+    verify_value = None
+    if args.verify:
+        ensure_ok(shortcut('ctrl+a', args.endpoint), 'Select all shortcut')
+        ensure_ok(shortcut('ctrl+c', args.endpoint), 'Copy shortcut')
+        verify_value = clipboard_get(args.endpoint)
+        if verify_value != args.text:
+            raise CliError(f'Verification mismatch. expected={args.text!r} actual={verify_value!r}')
+        steps.append({'step': 'verify_clipboard', 'text': verify_value})
+
+    payload = {
+        'ok': True,
+        'window': focus['window'],
+        'text': args.text,
+        'verified': bool(args.verify),
+        'target': target,
+        'clipboard': verify_value,
+        'steps': steps,
+    }
+    log_intent(args, intent='focus-write-verify', action='focus window, write text, and optionally verify clipboard', payload=payload, expected={'window': args.window, 'text': args.text, 'verify': bool(args.verify)})
+    if args.output == 'json':
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif args.output == 'compact':
+        print(json.dumps({'ok': True, 'window': focus['window'], 'verified': bool(args.verify), 'target': target}, ensure_ascii=False, indent=2))
+    else:
+        print(f'Focused {focus["window"]}, wrote text, and verified.' if args.verify else f'Focused {focus["window"]} and wrote text.')
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description='Windows MCP client bridge for the current WSL/Windows workstation')
+    parser.add_argument('--endpoint', default=DEFAULT_URL, help='Windows-side MCP endpoint')
+    parser.add_argument('--ledger-run', help='Write intent execution records to .control-runs/<run-id>/ledger.jsonl')
+    parser.add_argument('--risk-level', choices=['low', 'medium', 'high'], default='low')
+    parser.add_argument('--allow-sensitive', action='store_true', help='Allow sensitive actions such as raw PowerShell/Registry/FileSystem, process kill, or message send')
+    sub = parser.add_subparsers(dest='command', required=True)
+
+    p = sub.add_parser('call', help='Call any Windows-MCP tool by name with JSON args')
+    p.add_argument('tool')
+    p.add_argument('args', nargs='?')
+    p.add_argument('--output', choices=['text', 'compact', 'json'], default='text')
+    p.set_defaults(func=cmd_call)
+
+    p = sub.add_parser('tools', help='List available Windows-MCP tools')
+    p.add_argument('--output', choices=['summary', 'names', 'json'], default='summary')
+    p.set_defaults(func=cmd_tools)
+
+    p = sub.add_parser('snapshot', help='Take semantic desktop snapshot')
+    p.add_argument('--vision', action='store_true')
+    p.add_argument('--annotation', action='store_true')
+    p.add_argument('--no-ui-tree', action='store_true')
+    p.add_argument('--display', nargs='*', type=int)
+    p.add_argument('--output', choices=['text', 'compact', 'json'], default='text')
+    p.set_defaults(func=cmd_snapshot)
+
+    p = sub.add_parser('snapshot-find', help='Take snapshot and print lines matching a pattern')
+    p.add_argument('pattern')
+    p.add_argument('--case-sensitive', action='store_true')
+    p.add_argument('--limit', type=int, default=20)
+    p.add_argument('--output', choices=['text', 'json'], default='text')
+    p.set_defaults(func=cmd_snapshot_find)
+
+    p = sub.add_parser('window-find', help='Find the best matching window from snapshot text')
+    p.add_argument('pattern')
+    p.add_argument('--case-sensitive', action='store_true')
+    p.add_argument('--output', choices=['text', 'json'], default='text')
+    p.set_defaults(func=cmd_window_find)
+
+    p = sub.add_parser('focus-window', help='Focus a window by snapshot title/taskbar match')
+    p.add_argument('pattern')
+    p.add_argument('--case-sensitive', action='store_true')
+    p.add_argument('--output', choices=['text', 'compact', 'json'], default='text')
+    p.set_defaults(func=cmd_focus_window)
+
+    p = sub.add_parser('screenshot', help='Take fast screenshot-first snapshot')
+    p.add_argument('--annotation', action='store_true')
+    p.add_argument('--display', nargs='*', type=int)
+    p.add_argument('--output', choices=['text', 'compact', 'json'], default='compact')
+    p.set_defaults(func=cmd_screenshot)
+
+    p = sub.add_parser('resolve-target', help='Resolve a target using focused/pattern/window heuristics')
+    p.add_argument('--loc', nargs=2, type=int)
+    p.add_argument('--label', type=int)
+    p.add_argument('--target-pattern')
+    p.add_argument('--window')
+    p.add_argument('--case-sensitive', action='store_true')
+    p.add_argument('--prefer-focused', action='store_true')
+    p.add_argument('--control-type', action='append', choices=['edit', 'button', 'link', 'list item', 'radio button', 'pane', 'region'])
+    p.add_argument('--output', choices=['text', 'json'], default='json')
+    p.set_defaults(func=cmd_resolve_target)
+
+    p = sub.add_parser('clipboard', help='Get or set clipboard text')
+    p.add_argument('--set', dest='set')
+    p.add_argument('--output', choices=['text', 'compact', 'json'], default='text')
+    p.set_defaults(func=cmd_clipboard)
+
+    p = sub.add_parser('app', help='Launch, switch, or resize app windows')
+    p.add_argument('mode', choices=['launch', 'switch', 'resize'])
+    p.add_argument('--name')
+    p.add_argument('--window-loc', nargs=2, type=int)
+    p.add_argument('--window-size', nargs=2, type=int)
+    p.add_argument('--output', choices=['text', 'compact', 'json'], default='text')
+    p.set_defaults(func=cmd_app)
+
+    p = sub.add_parser('type', help='Type text into a target loc/label')
+    p.add_argument('text')
+    p.add_argument('--loc', nargs=2, type=int)
+    p.add_argument('--label', type=int)
+    p.add_argument('--clear', action='store_true')
+    p.add_argument('--enter', action='store_true')
+    p.add_argument('--output', choices=['text', 'compact', 'json'], default='text')
+    p.set_defaults(func=cmd_type)
+
+    p = sub.add_parser('click', help='Click a target loc/label')
+    p.add_argument('--loc', nargs=2, type=int)
+    p.add_argument('--label', type=int)
+    p.add_argument('--button', choices=['left', 'right', 'middle'], default='left')
+    p.add_argument('--clicks', type=int, default=1)
+    p.add_argument('--output', choices=['text', 'compact', 'json'], default='text')
+    p.set_defaults(func=cmd_click)
+
+    p = sub.add_parser('shortcut', help='Send a keyboard shortcut')
+    p.add_argument('shortcut')
+    p.add_argument('--output', choices=['text', 'compact', 'json'], default='text')
+    p.set_defaults(func=cmd_shortcut)
+
+    p = sub.add_parser('process', help='List or kill processes')
+    p.add_argument('mode', choices=['list', 'kill'])
+    p.add_argument('--name')
+    p.add_argument('--pid', type=int)
+    p.add_argument('--sort-by', choices=['memory', 'cpu', 'name'], default='memory')
+    p.add_argument('--limit', type=int, default=20)
+    p.add_argument('--force', action='store_true')
+    p.add_argument('--output', choices=['text', 'compact', 'json'], default='text')
+    p.set_defaults(func=cmd_process)
+
+    p = sub.add_parser('write-verify', help='Semantic-first write workflow with optional clipboard verification')
+    p.add_argument('text')
+    p.add_argument('--loc', nargs=2, type=int)
+    p.add_argument('--label', type=int)
+    p.add_argument('--target-pattern')
+    p.add_argument('--case-sensitive', action='store_true')
+    p.add_argument('--prefer-focused', action='store_true')
+    p.add_argument('--control-type', action='append', choices=['edit', 'button', 'link', 'list item', 'radio button', 'pane', 'region'])
+    p.add_argument('--method', choices=['type', 'paste'], default='type')
+    p.add_argument('--clear', action='store_true')
+    p.add_argument('--enter', action='store_true')
+    p.add_argument('--verify', action='store_true', help='Verify by select-all/copy/clipboard exact match')
+    p.add_argument('--output', choices=['text', 'compact', 'json'], default='text')
+    p.set_defaults(func=cmd_write_verify)
+
+    p = sub.add_parser('focus-address-bar-open', help='Focus browser window, replace address bar, and open URL atomically')
+    p.add_argument('window')
+    p.add_argument('url')
+    p.add_argument('--case-sensitive', action='store_true')
+    p.add_argument('--verify', action='store_true')
+    p.add_argument('--output', choices=['text', 'compact', 'json'], default='text')
+    p.set_defaults(func=cmd_focus_address_bar_open)
+
+    p = sub.add_parser('open-resource', help='Universal intent: focus a window, open a resource, and verify outcome')
+    p.add_argument('window')
+    p.add_argument('resource')
+    p.add_argument('expect')
+    p.add_argument('--case-sensitive', action='store_true')
+    p.add_argument('--verify-input', action='store_true')
+    p.add_argument('--output', choices=['text', 'compact', 'json'], default='text')
+    p.set_defaults(func=cmd_open_resource)
+
+    p = sub.add_parser('focus-open-verify', help='Compatibility wrapper for browser open+verify; prefer open-resource')
+    p.add_argument('window')
+    p.add_argument('url')
+    p.add_argument('expect')
+    p.add_argument('--case-sensitive', action='store_true')
+    p.add_argument('--verify-address', action='store_true')
+    p.add_argument('--output', choices=['text', 'compact', 'json'], default='text')
+    p.set_defaults(func=cmd_focus_open_verify)
+
+    p = sub.add_parser('send-composed-message', help='Universal intent: fill a composition surface and optionally send/verify')
+    p.add_argument('window')
+    p.add_argument('text')
+    p.add_argument('--target-pattern', default='Message')
+    p.add_argument('--adapter', choices=['auto', 'generic-edit', 'browser-search'], default='auto')
+    p.add_argument('--case-sensitive', action='store_true')
+    p.add_argument('--verify-input', action='store_true')
+    p.add_argument('--send', action='store_true')
+    p.add_argument('--verify-sent', action='store_true')
+    p.add_argument('--output', choices=['text', 'compact', 'json'], default='text')
+    p.set_defaults(func=cmd_send_composed_message)
+
+    p = sub.add_parser('fill-search-surface', help='Universal intent: fill a search-like input surface and verify the query landed')
+    p.add_argument('window')
+    p.add_argument('query')
+    p.add_argument('--target-pattern', default='Search')
+    p.add_argument('--adapter', choices=['auto', 'generic-edit', 'browser-search'], default='auto')
+    p.add_argument('--case-sensitive', action='store_true')
+    p.add_argument('--verify-input', action='store_true')
+    p.add_argument('--output', choices=['text', 'compact', 'json'], default='text')
+    p.set_defaults(func=cmd_fill_search_surface)
+
+    p = sub.add_parser('focus-message-box-send', help='Compatibility wrapper for message composition/send; prefer send-composed-message')
+    p.add_argument('window')
+    p.add_argument('text')
+    p.add_argument('--target-pattern', default='Message')
+    p.add_argument('--case-sensitive', action='store_true')
+    p.add_argument('--verify-input', action='store_true')
+    p.add_argument('--send', action='store_true')
+    p.add_argument('--verify-sent', action='store_true')
+    p.add_argument('--output', choices=['text', 'compact', 'json'], default='text')
+    p.set_defaults(func=cmd_focus_message_box_send)
+
+    p = sub.add_parser('focus-write-verify', help='Focus a window, choose a target, write text, and verify it')
+    p.add_argument('window')
+    p.add_argument('text')
+    p.add_argument('--loc', nargs=2, type=int)
+    p.add_argument('--label', type=int)
+    p.add_argument('--target-pattern')
+    p.add_argument('--case-sensitive', action='store_true')
+    p.add_argument('--prefer-focused', action='store_true')
+    p.add_argument('--control-type', action='append', choices=['edit', 'button', 'link', 'list item', 'radio button', 'pane', 'region'])
+    p.add_argument('--method', choices=['type', 'paste'], default='type')
+    p.add_argument('--clear', action='store_true')
+    p.add_argument('--enter', action='store_true')
+    p.add_argument('--verify', action='store_true')
+    p.add_argument('--output', choices=['text', 'compact', 'json'], default='text')
+    p.set_defaults(func=cmd_focus_write_verify)
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        enforce_safety_gate(args)
+        return args.func(args)
+    except CliError as e:
+        log_failure(args, e)
+        print(f'ERROR: {e}', file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print('Interrupted', file=sys.stderr)
+        return 130
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
