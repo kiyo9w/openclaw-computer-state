@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import re
+import subprocess
+import time
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[1]
+COMPUTER_STATE = ROOT / "scripts" / "computer-state"
+RUN_DIR = ROOT / ".control-runs" / "workflows"
+VAR_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+class CliError(Exception):
+    pass
+
+
+def print_json(value: Any) -> None:
+    print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def read_json(path: str | Path) -> dict[str, Any]:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise CliError(f"expected JSON object in {path}")
+    return payload
+
+
+def write_json(path: str | Path, payload: dict[str, Any]) -> None:
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def run_json(cmd: list[str], timeout: int = 90) -> dict[str, Any]:
+    proc = subprocess.run(cmd, cwd=str(ROOT), text=True, capture_output=True, timeout=timeout)
+    raw = proc.stdout or proc.stderr
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise CliError(f"invalid JSON from {' '.join(cmd)}: {exc}\n{raw}") from exc
+    if not isinstance(payload, dict):
+        raise CliError("expected JSON object")
+    if proc.returncode != 0 and payload.get("ok") is not False:
+        payload["ok"] = False
+        payload["returncode"] = proc.returncode
+    return payload
+
+
+def parse_vars(values: list[str]) -> dict[str, str]:
+    out = {}
+    for item in values:
+        if "=" not in item:
+            raise CliError(f"invalid --var value, expected NAME=VALUE: {item}")
+        key, value = item.split("=", 1)
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            raise CliError(f"invalid variable name: {key}")
+        out[key] = value
+    return out
+
+
+def render_value(value: Any, variables: dict[str, str]) -> Any:
+    if isinstance(value, str):
+        def replace(match: re.Match[str]) -> str:
+            key = match.group(1)
+            if key not in variables:
+                raise CliError(f"missing workflow variable: {key}")
+            return variables[key]
+        return VAR_PATTERN.sub(replace, value)
+    if isinstance(value, list):
+        return [render_value(item, variables) for item in value]
+    if isinstance(value, dict):
+        return {key: render_value(item, variables) for key, item in value.items()}
+    return value
+
+
+def validate_workflow(payload: dict[str, Any]) -> list[str]:
+    errors = []
+    if payload.get("version") != 1:
+        errors.append("version must be 1")
+    if not payload.get("name"):
+        errors.append("name is required")
+    if payload.get("surface") not in ("mac", "win"):
+        errors.append("surface must be mac or win")
+    steps = payload.get("steps")
+    if not isinstance(steps, list):
+        errors.append("steps must be a list")
+        return errors
+    for i, step in enumerate(steps, 1):
+        if not isinstance(step, dict):
+            errors.append(f"step {i} must be an object")
+            continue
+        if step.get("action") not in {"click", "set-value", "type-into", "type-text", "press-key", "scroll", "drag", "perform-action"}:
+            errors.append(f"step {i} has unsupported action: {step.get('action')}")
+        if "args" in step and not isinstance(step["args"], dict):
+            errors.append(f"step {i} args must be an object")
+    return errors
+
+
+def workflow_template(name: str, surface: str) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "name": name,
+        "surface": surface,
+        "description": "",
+        "defaults": {
+            "retries": 1,
+            "settle_ms": 250,
+            "diff_limit": 20,
+            "max_chars": 12000,
+        },
+        "fingerprint": {
+            "createdAt": int(time.time()),
+            "screen": None,
+            "app": None,
+        },
+        "steps": [],
+    }
+
+
+def step_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    step_args: dict[str, Any] = {}
+    for key in (
+        "id",
+        "query",
+        "role",
+        "label",
+        "x",
+        "y",
+        "x1",
+        "y1",
+        "x2",
+        "y2",
+        "dx",
+        "dy",
+        "button",
+        "clicks",
+        "key",
+        "text",
+        "ax_action",
+        "clear",
+        "enter",
+    ):
+        value = getattr(args, key, None)
+        if value is not None and value is not False:
+            step_args[key] = value
+    step: dict[str, Any] = {
+        "name": args.step_name or args.action,
+        "action": args.action,
+        "args": step_args,
+    }
+    for key in ("expect", "retries", "settle_ms", "diff_limit", "max_chars"):
+        value = getattr(args, key, None)
+        if value is not None:
+            step[key] = value
+    if args.optional:
+        step["optional"] = True
+    return step
+
+
+def command_init(args: argparse.Namespace) -> int:
+    payload = workflow_template(args.name, args.surface)
+    if args.description:
+        payload["description"] = args.description
+    write_json(args.file, payload)
+    print_json({"ok": True, "file": args.file, "workflow": payload})
+    return 0
+
+
+def command_add(args: argparse.Namespace) -> int:
+    payload = read_json(args.file)
+    errors = validate_workflow(payload)
+    if errors:
+        raise CliError("; ".join(errors))
+    payload["steps"].append(step_from_args(args))
+    write_json(args.file, payload)
+    print_json({"ok": True, "file": args.file, "steps": len(payload["steps"]), "added": payload["steps"][-1]})
+    return 0
+
+
+def command_validate(args: argparse.Namespace) -> int:
+    payload = read_json(args.file)
+    errors = validate_workflow(payload)
+    print_json({"ok": not errors, "file": args.file, "errors": errors, "steps": len(payload.get("steps", [])) if isinstance(payload.get("steps"), list) else 0})
+    return 0 if not errors else 1
+
+
+def build_act_command(workflow: dict[str, Any], step: dict[str, Any], variables: dict[str, str]) -> list[str]:
+    defaults = workflow.get("defaults") if isinstance(workflow.get("defaults"), dict) else {}
+    rendered = render_value(step, variables)
+    args = rendered.get("args") if isinstance(rendered.get("args"), dict) else {}
+    cmd = [str(COMPUTER_STATE), "act", "--surface", str(workflow["surface"]), str(rendered["action"])]
+    for key, flag in (
+        ("id", "--id"),
+        ("query", "--query"),
+        ("role", "--role"),
+        ("label", "--label"),
+        ("x", "--x"),
+        ("y", "--y"),
+        ("x1", "--x1"),
+        ("y1", "--y1"),
+        ("x2", "--x2"),
+        ("y2", "--y2"),
+        ("dx", "--dx"),
+        ("dy", "--dy"),
+        ("button", "--button"),
+        ("clicks", "--clicks"),
+        ("key", "--key"),
+        ("text", "--text"),
+        ("ax_action", "--ax-action"),
+    ):
+        if args.get(key) is not None:
+            cmd.extend([flag, str(args[key])])
+    if args.get("clear"):
+        cmd.append("--clear")
+    if args.get("enter"):
+        cmd.append("--enter")
+    for key, flag in (
+        ("expect", "--expect"),
+        ("retries", "--retries"),
+        ("settle_ms", "--settle-ms"),
+        ("diff_limit", "--diff-limit"),
+        ("max_chars", "--max-chars"),
+    ):
+        value = rendered.get(key, defaults.get(key))
+        if value is not None:
+            cmd.extend([flag, str(value)])
+    for key, flag in (
+        ("max_depth", "--max-depth"),
+        ("max_nodes", "--max-nodes"),
+    ):
+        value = rendered.get(key, defaults.get(key))
+        if value is not None:
+            cmd.extend([flag, str(value)])
+    return cmd
+
+
+def command_replay(args: argparse.Namespace) -> int:
+    workflow = read_json(args.file)
+    errors = validate_workflow(workflow)
+    if errors:
+        raise CliError("; ".join(errors))
+    variables = parse_vars(args.var)
+    steps = workflow.get("steps", [])
+    selected = []
+    for index, step in enumerate(steps, 1):
+        if args.from_step and index < args.from_step:
+            continue
+        if args.to_step and index > args.to_step:
+            continue
+        selected.append((index, step))
+
+    report = {
+        "ok": True,
+        "workflow": workflow.get("name"),
+        "surface": workflow.get("surface"),
+        "file": str(args.file),
+        "dryRun": args.dry_run,
+        "startedAt": int(time.time()),
+        "steps": [],
+    }
+    for index, step in selected:
+        started = time.time()
+        cmd = build_act_command(workflow, step, variables)
+        row: dict[str, Any] = {
+            "index": index,
+            "name": step.get("name") or step.get("action"),
+            "action": step.get("action"),
+            "command": cmd,
+            "optional": bool(step.get("optional")),
+        }
+        if args.dry_run:
+            row["ok"] = True
+        else:
+            payload = run_json(cmd, timeout=args.step_timeout)
+            row["ok"] = bool(payload.get("ok"))
+            row["result"] = payload
+        row["durationMs"] = int((time.time() - started) * 1000)
+        report["steps"].append(row)
+        if not row["ok"] and not row["optional"]:
+            report["ok"] = False
+            break
+    report["finishedAt"] = int(time.time())
+    if args.report:
+        write_json(args.report, report)
+        report["report"] = args.report
+    print_json(report)
+    return 0 if report["ok"] else 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Record and replay state-aware computer workflows.")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("init")
+    p.add_argument("--file", required=True)
+    p.add_argument("--name", required=True)
+    p.add_argument("--surface", choices=["mac", "win"], required=True)
+    p.add_argument("--description")
+    p.set_defaults(func=command_init)
+
+    p = sub.add_parser("add")
+    p.add_argument("--file", required=True)
+    p.add_argument("--step-name")
+    p.add_argument("--optional", action="store_true")
+    p.add_argument("action", choices=["click", "set-value", "type-into", "type-text", "press-key", "scroll", "drag", "perform-action"])
+    p.add_argument("--id", type=int)
+    p.add_argument("--query")
+    p.add_argument("--role")
+    p.add_argument("--label")
+    p.add_argument("--x", type=float)
+    p.add_argument("--y", type=float)
+    p.add_argument("--x1", type=float)
+    p.add_argument("--y1", type=float)
+    p.add_argument("--x2", type=float)
+    p.add_argument("--y2", type=float)
+    p.add_argument("--dx", type=int)
+    p.add_argument("--dy", type=int)
+    p.add_argument("--button", choices=["left", "right", "middle"])
+    p.add_argument("--clicks", type=int)
+    p.add_argument("--key")
+    p.add_argument("--text")
+    p.add_argument("--ax-action", dest="ax_action")
+    p.add_argument("--clear", action="store_true")
+    p.add_argument("--enter", action="store_true")
+    p.add_argument("--expect")
+    p.add_argument("--retries", type=int)
+    p.add_argument("--settle-ms", type=int)
+    p.add_argument("--diff-limit", type=int)
+    p.add_argument("--max-chars", type=int)
+    p.set_defaults(func=command_add)
+
+    p = sub.add_parser("validate")
+    p.add_argument("--file", required=True)
+    p.set_defaults(func=command_validate)
+
+    p = sub.add_parser("replay")
+    p.add_argument("--file", required=True)
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--from-step", type=int)
+    p.add_argument("--to-step", type=int)
+    p.add_argument("--var", action="append", default=[])
+    p.add_argument("--report")
+    p.add_argument("--step-timeout", type=int, default=90)
+    p.set_defaults(func=command_replay)
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        return args.func(args)
+    except (CliError, subprocess.TimeoutExpired) as exc:
+        print_json({"ok": False, "error": str(exc)})
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

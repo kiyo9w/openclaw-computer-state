@@ -8,6 +8,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPUTER_STATE = ROOT / "scripts" / "computer-state"
+COMPUTER_WORKFLOW = ROOT / "scripts" / "computer-workflow"
 MCP = ROOT / "scripts" / "computer-state-mcp"
 RUN_DIR = ROOT / ".control-runs" / "evals" / time.strftime("%Y%m%d-%H%M%S")
 
@@ -54,9 +55,11 @@ def main() -> int:
     RUN_DIR.mkdir(parents=True, exist_ok=True)
     before = RUN_DIR / "win-before.json"
     annotated = RUN_DIR / "mac-annotated.png"
+    workflow = ROOT / "examples" / "workflows" / "win-esc-smoke.json"
+    workflow_report = RUN_DIR / "workflow-report.json"
     mcp_input = '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}\n'
     cases = [
-        case("python syntax", ["python3", "-m", "py_compile", str(COMPUTER_STATE), str(MCP)]),
+        case("python syntax", ["python3", "-m", "py_compile", str(COMPUTER_STATE), str(COMPUTER_WORKFLOW), str(MCP)]),
         case("facade tools", [str(COMPUTER_STATE), "tools"]),
         case("mcp tools/list", [str(MCP)], stdin=mcp_input),
         case("mac healthcheck", [str(COMPUTER_STATE), "healthcheck", "--surface", "mac"], timeout=40),
@@ -64,6 +67,9 @@ def main() -> int:
         case("win save state", [str(COMPUTER_STATE), "get-state", "--surface", "win", "--max-chars", "3000", "--save-state", str(before)], timeout=60),
         case("win state diff", [str(COMPUTER_STATE), "get-state", "--surface", "win", "--max-chars", "3000", "--diff-from", str(before), "--diff-limit", "5"], timeout=60),
         case("win act esc", [str(COMPUTER_STATE), "act", "--surface", "win", "press-key", "--key", "ESC", "--retries", "0", "--max-chars", "2000"], timeout=60),
+        case("workflow validate", [str(COMPUTER_WORKFLOW), "validate", "--file", str(workflow)], timeout=30),
+        case("workflow dry-run", [str(COMPUTER_WORKFLOW), "replay", "--file", str(workflow), "--dry-run"], timeout=30),
+        case("workflow replay", [str(COMPUTER_WORKFLOW), "replay", "--file", str(workflow), "--report", str(workflow_report)], timeout=90),
         case("mac annotated state", [str(COMPUTER_STATE), "annotate-state", "--surface", "mac", "--max-depth", "2", "--max-nodes", "50", "--out", str(annotated)], timeout=60),
     ]
     summary = {

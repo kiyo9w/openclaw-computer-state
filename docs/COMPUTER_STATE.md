@@ -76,6 +76,26 @@ scripts/computer-state act --surface mac click --app "ChatGPT Atlas" --query Hel
 scripts/computer-state act --surface win type-text --x 948 --y 987 --text "hello" --expect hello --retries 1
 ```
 
+For repeatable workflows, use `computer-workflow`. This stores a small JSON recipe and replays every step through `act`, so each step still gets before/after state diff, expectation checks, and bounded retry:
+
+```bash
+scripts/computer-workflow init --file /tmp/open-repo.json --name open-repo --surface win
+scripts/computer-workflow add --file /tmp/open-repo.json press-key --key "CTRL+L" --step-name address-bar
+scripts/computer-workflow add --file /tmp/open-repo.json type-text --text "https://github.com/kiyo9w/openclaw-computer-state" --enter --expect "openclaw-computer-state" --step-name navigate
+scripts/computer-workflow validate --file /tmp/open-repo.json
+scripts/computer-workflow replay --file /tmp/open-repo.json --report /tmp/open-repo-report.json
+```
+
+Workflow text fields support variables for data entry and environment-specific values:
+
+```json
+{"name": "navigate", "action": "type-text", "args": {"text": "${URL}", "enter": true}, "expect": "${EXPECT}"}
+```
+
+```bash
+scripts/computer-workflow replay --file /tmp/open-repo.json --var URL=https://github.com/kiyo9w/openclaw-computer-state --var EXPECT=openclaw-computer-state
+```
+
 Windows snapshots are capped at 20k chars by default to avoid agent context overflow. Use `--max-chars 0` only when the full UI tree is explicitly needed. Windows `find` caps each matched line at 500 chars by default for the same reason.
 
 Use raw `--x/--y` only when semantic targets are unavailable.
@@ -95,6 +115,7 @@ Codex Computer Use is strong because it has a state model: screenshot plus Acces
 - `annotate-state`
 - `find`
 - `act`
+- `computer-workflow replay`
 - `click`
 - `set-value`
 - `type-into`
@@ -120,6 +141,7 @@ Codex Computer Use is strong because it has a state model: screenshot plus Acces
 - `computer_annotate_state`
 - `computer_find`
 - `computer_act`
+- `computer_replay_workflow`
 - `computer_click`
 - `computer_set_value`
 - `computer_type_into`

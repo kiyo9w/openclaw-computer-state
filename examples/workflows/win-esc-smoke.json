@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "name": "win-esc-smoke",
+  "surface": "win",
+  "description": "Minimal replay smoke test that exercises state capture, key press, diff, and report output.",
+  "defaults": {
+    "retries": 0,
+    "settle_ms": 150,
+    "diff_limit": 10,
+    "max_chars": 3000
+  },
+  "fingerprint": {
+    "createdAt": 1780000000,
+    "screen": null,
+    "app": null
+  },
+  "steps": [
+    {
+      "name": "press escape",
+      "action": "press-key",
+      "args": {
+        "key": "ESC"
+      }
+    }
+  ]
+}

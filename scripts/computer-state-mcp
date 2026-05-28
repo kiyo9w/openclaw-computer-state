@@ -8,6 +8,7 @@ from typing import Any
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
 COMPUTER_STATE = WORKSPACE_ROOT / "scripts" / "computer-state"
+COMPUTER_WORKFLOW = WORKSPACE_ROOT / "scripts" / "computer-workflow"
 SERVER_NAME = "openclaw-computer-state"
 SERVER_VERSION = "0.1.0"
 USE_CONTENT_LENGTH = False
@@ -174,6 +175,26 @@ TOOLS: list[dict[str, Any]] = [
                 **GLOBAL,
             },
             ["action"],
+        ),
+    },
+    {
+        "name": "computer_replay_workflow",
+        "description": "Replay a state-aware workflow JSON through computer_act. Supports dry-run, step ranges, variable substitution, and JSON reports.",
+        "inputSchema": schema_object(
+            {
+                "file": {"type": "string", "description": "Workflow JSON path."},
+                "dry_run": {"type": "boolean", "default": False},
+                "from_step": {"type": "integer"},
+                "to_step": {"type": "integer"},
+                "var": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Variable substitutions in NAME=VALUE form for ${NAME} placeholders.",
+                },
+                "report": {"type": "string", "description": "Optional path for full replay report JSON."},
+                "step_timeout": {"type": "integer", "default": 90},
+            },
+            ["file"],
         ),
     },
     {
@@ -617,6 +638,38 @@ def run_computer_state(command: str, args: dict[str, Any]) -> dict[str, Any]:
     return parsed
 
 
+def run_computer_workflow(command: str, args: dict[str, Any]) -> dict[str, Any]:
+    cmd = [str(COMPUTER_WORKFLOW), command]
+    if command == "replay":
+        cmd.extend(["--file", str(args["file"])])
+        if args.get("dry_run"):
+            cmd.append("--dry-run")
+        if args.get("from_step") is not None:
+            cmd.extend(["--from-step", str(args["from_step"])])
+        if args.get("to_step") is not None:
+            cmd.extend(["--to-step", str(args["to_step"])])
+        for item in args.get("var") or []:
+            cmd.extend(["--var", str(item)])
+        if args.get("report"):
+            cmd.extend(["--report", str(args["report"])])
+        if args.get("step_timeout") is not None:
+            cmd.extend(["--step-timeout", str(args["step_timeout"])])
+    else:
+        raise ValueError(f"unknown workflow command: {command}")
+    proc = subprocess.run(cmd, cwd=str(WORKSPACE_ROOT), text=True, capture_output=True, timeout=120)
+    raw = proc.stdout or proc.stderr
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"invalid JSON from computer-workflow: {exc}\n{raw}") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError("expected JSON object from computer-workflow")
+    if proc.returncode != 0 and parsed.get("ok") is not False:
+        parsed["ok"] = False
+        parsed["returncode"] = proc.returncode
+    return parsed
+
+
 def tool_result(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)}],
@@ -648,6 +701,8 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         "computer_wait_for": "wait-for",
     }
     if name not in mapping:
+        if name == "computer_replay_workflow":
+            return tool_result(run_computer_workflow("replay", args))
         raise ValueError(f"unknown tool: {name}")
     return tool_result(run_computer_state(mapping[name], args))
 

@@ -20,6 +20,7 @@ The MCP server exposes:
 - `computer_annotate_state`
 - `computer_find`
 - `computer_act`
+- `computer_replay_workflow`
 - `computer_click`
 - `computer_set_value`
 - `computer_type_into`
@@ -41,6 +42,7 @@ scripts/computer-state healthcheck --surface mac
 scripts/computer-state healthcheck --surface win
 scripts/computer-state get-state --surface win --save-state /tmp/before.json
 scripts/computer-state get-state --surface win --diff-from /tmp/before.json
+scripts/computer-workflow replay --file examples/workflows/win-esc-smoke.json --report /tmp/workflow-report.json
 scripts/eval-computer-state
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | scripts/computer-state-mcp
 ```
