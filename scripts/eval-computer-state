@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+import json
+import subprocess
+import time
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[1]
+COMPUTER_STATE = ROOT / "scripts" / "computer-state"
+MCP = ROOT / "scripts" / "computer-state-mcp"
+RUN_DIR = ROOT / ".control-runs" / "evals" / time.strftime("%Y%m%d-%H%M%S")
+
+
+def run(cmd: list[str], timeout: int = 60, stdin: str | None = None) -> dict[str, Any]:
+    started = time.time()
+    try:
+        proc = subprocess.run(cmd, cwd=str(ROOT), input=stdin, text=True, capture_output=True, timeout=timeout)
+        return {
+            "cmd": cmd,
+            "ok": proc.returncode == 0,
+            "returncode": proc.returncode,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "durationMs": int((time.time() - started) * 1000),
+        }
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "cmd": cmd,
+            "ok": False,
+            "returncode": 124,
+            "stdout": exc.stdout or "",
+            "stderr": exc.stderr or "timeout",
+            "durationMs": int((time.time() - started) * 1000),
+        }
+
+
+def parse_json(text: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(text)
+        return payload if isinstance(payload, dict) else {"ok": False, "error": "not an object"}
+    except json.JSONDecodeError as exc:
+        return {"ok": False, "error": str(exc), "text": text[:500]}
+
+
+def case(name: str, cmd: list[str], timeout: int = 60, stdin: str | None = None) -> dict[str, Any]:
+    result = run(cmd, timeout=timeout, stdin=stdin)
+    payload = parse_json(result["stdout"]) if result["stdout"].strip().startswith("{") else None
+    ok = result["ok"] and (payload is None or bool(payload.get("ok", True)))
+    return {"name": name, "ok": ok, "result": result, "payload": payload}
+
+
+def main() -> int:
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    before = RUN_DIR / "win-before.json"
+    annotated = RUN_DIR / "mac-annotated.png"
+    mcp_input = '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}\n'
+    cases = [
+        case("python syntax", ["python3", "-m", "py_compile", str(COMPUTER_STATE), str(MCP)]),
+        case("facade tools", [str(COMPUTER_STATE), "tools"]),
+        case("mcp tools/list", [str(MCP)], stdin=mcp_input),
+        case("mac healthcheck", [str(COMPUTER_STATE), "healthcheck", "--surface", "mac"], timeout=40),
+        case("win healthcheck", [str(COMPUTER_STATE), "healthcheck", "--surface", "win"], timeout=40),
+        case("win save state", [str(COMPUTER_STATE), "get-state", "--surface", "win", "--max-chars", "3000", "--save-state", str(before)], timeout=60),
+        case("win state diff", [str(COMPUTER_STATE), "get-state", "--surface", "win", "--max-chars", "3000", "--diff-from", str(before), "--diff-limit", "5"], timeout=60),
+        case("win act esc", [str(COMPUTER_STATE), "act", "--surface", "win", "press-key", "--key", "ESC", "--retries", "0", "--max-chars", "2000"], timeout=60),
+        case("mac annotated state", [str(COMPUTER_STATE), "annotate-state", "--surface", "mac", "--max-depth", "2", "--max-nodes", "50", "--out", str(annotated)], timeout=60),
+    ]
+    summary = {
+        "ok": all(item["ok"] for item in cases),
+        "runDir": str(RUN_DIR),
+        "cases": [
+            {
+                "name": item["name"],
+                "ok": item["ok"],
+                "durationMs": item["result"]["durationMs"],
+                "returncode": item["result"]["returncode"],
+                "payloadOk": item["payload"].get("ok") if isinstance(item.get("payload"), dict) else None,
+            }
+            for item in cases
+        ],
+    }
+    (RUN_DIR / "report.json").write_text(json.dumps({"summary": summary, "cases": cases}, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return 0 if summary["ok"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -33,6 +33,21 @@ scripts/computer-state get-state --surface mac --app "ChatGPT Atlas" --copy-scre
 scripts/computer-state get-state --surface win --copy-screenshot-default --max-chars 20000
 ```
 
+For context-efficient verification, save and diff state captures instead of repeatedly dumping full UI trees:
+
+```bash
+scripts/computer-state get-state --surface win --max-chars 12000 --save-state /tmp/before.json
+scripts/computer-state get-state --surface win --max-chars 12000 --diff-from /tmp/before.json --diff-limit 20
+```
+
+For visual grounding on macOS, generate an annotated screenshot with Accessibility ids and roles:
+
+```bash
+scripts/computer-state annotate-state --surface mac --app "ChatGPT Atlas" --out /tmp/chatgpt-annotated.png
+```
+
+If Pillow is unavailable, `annotate-state` writes an SVG overlay next to the requested PNG path. Install Pillow only if PNG output is required.
+
 Then act using semantic targets whenever possible:
 
 ```bash
@@ -54,6 +69,13 @@ scripts/computer-state drag --surface win --x1 500 --y1 500 --x2 700 --y2 700
 scripts/computer-state wait-for --surface win --query Message --timeout-ms 3000
 ```
 
+For action-level repair loops, use `act`. It captures state before and after, returns a compact diff, optionally verifies that an expected query appears, and retries boundedly:
+
+```bash
+scripts/computer-state act --surface mac click --app "ChatGPT Atlas" --query Help --role MenuBarItem --expect Help --retries 1
+scripts/computer-state act --surface win type-text --x 948 --y 987 --text "hello" --expect hello --retries 1
+```
+
 Windows snapshots are capped at 20k chars by default to avoid agent context overflow. Use `--max-chars 0` only when the full UI tree is explicitly needed. Windows `find` caps each matched line at 500 chars by default for the same reason.
 
 Use raw `--x/--y` only when semantic targets are unavailable.
@@ -70,7 +92,9 @@ Codex Computer Use is strong because it has a state model: screenshot plus Acces
 `scripts/computer-state` is a thin facade so agents can reason in one vocabulary:
 
 - `get-state`
+- `annotate-state`
 - `find`
+- `act`
 - `click`
 - `set-value`
 - `type-into`
@@ -93,7 +117,9 @@ Codex Computer Use is strong because it has a state model: screenshot plus Acces
 - `computer_list_apps`
 - `computer_app`
 - `computer_get_state`
+- `computer_annotate_state`
 - `computer_find`
+- `computer_act`
 - `computer_click`
 - `computer_set_value`
 - `computer_type_into`
@@ -118,6 +144,14 @@ printf '%s\n' \
   | scripts/computer-state-mcp
 ```
 
+Run the cross-surface eval suite when changing control behavior:
+
+```bash
+scripts/eval-computer-state
+```
+
+The eval writes a JSON report under `.control-runs/evals/` with per-case latency and pass/fail status.
+
 ## Verification
 
 Verified on 2026-05-28:
@@ -129,6 +163,8 @@ scripts/computer-state healthcheck --surface mac
 scripts/computer-state healthcheck --surface win
 scripts/computer-state get-state --surface mac --app "ChatGPT Atlas" --copy-screenshot-default
 scripts/computer-state get-state --surface win --copy-screenshot-default --max-chars 20000
+scripts/computer-state get-state --surface win --max-chars 3000 --save-state /tmp/computer-state-before.json
+scripts/computer-state get-state --surface win --max-chars 3000 --diff-from /tmp/computer-state-before.json --diff-limit 5
 scripts/computer-state find --surface mac --app "ChatGPT Atlas" --query Help --role MenuBarItem
 scripts/computer-state find --surface win --query Brave --limit 3
 scripts/computer-state list-apps --surface mac

@@ -102,6 +102,205 @@ def truncate_text(text: str, max_chars: int, flag: str = "--max-chars") -> tuple
     return text[:keep] + suffix, True, original_len
 
 
+def write_json_file(path: str | Path, payload: dict[str, Any]) -> None:
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def read_json_file(path: str | Path) -> dict[str, Any]:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise CliError(f"expected JSON object in {path}")
+    return payload
+
+
+def node_line(node: dict[str, Any]) -> str:
+    parts = [
+        str(node.get("role") or ""),
+        str(node.get("title") or ""),
+        str(node.get("description") or ""),
+        str(node.get("value") or ""),
+    ]
+    return " | ".join(part.strip() for part in parts if part and part.strip())
+
+
+def state_lines(payload: dict[str, Any]) -> list[str]:
+    if isinstance(payload.get("nodes"), list):
+        return [node_line(node) for node in payload["nodes"] if isinstance(node, dict) and node_line(node)]
+    accessibility = payload.get("accessibility")
+    if isinstance(accessibility, dict) and isinstance(accessibility.get("nodes"), list):
+        return [node_line(node) for node in accessibility["nodes"] if isinstance(node, dict) and node_line(node)]
+    if isinstance(payload.get("snapshotText"), str):
+        return [line.strip() for line in payload["snapshotText"].splitlines() if line.strip()]
+    return []
+
+
+def compute_state_diff(before: dict[str, Any], after: dict[str, Any], limit: int = 40) -> dict[str, Any]:
+    before_lines = state_lines(before)
+    after_lines = state_lines(after)
+    before_set = set(before_lines)
+    after_set = set(after_lines)
+    added = [line for line in after_lines if line not in before_set]
+    removed = [line for line in before_lines if line not in after_set]
+    return {
+        "added": added[:limit],
+        "removed": removed[:limit],
+        "addedTotal": len(added),
+        "removedTotal": len(removed),
+        "limit": limit,
+        "changed": bool(added or removed),
+        "beforeLines": len(before_lines),
+        "afterLines": len(after_lines),
+    }
+
+
+def draw_annotations(image_path: str | Path, out_path: str | Path, nodes: list[dict[str, Any]], limit: int = 80) -> dict[str, Any]:
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError as exc:
+        return draw_svg_annotations(image_path, out_path, nodes, limit)
+
+    image = Image.open(image_path).convert("RGBA")
+    draw = ImageDraw.Draw(image)
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", 12)
+    except Exception:
+        font = ImageFont.load_default()
+
+    drawn = 0
+    for node in nodes:
+        if drawn >= limit:
+            break
+        frame = node.get("frame")
+        if not isinstance(frame, dict):
+            continue
+        try:
+            x = float(frame["x"])
+            y = float(frame["y"])
+            w = float(frame["width"])
+            h = float(frame["height"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if w <= 3 or h <= 3:
+            continue
+        label = str(node.get("id") or "")
+        role = str(node.get("role") or "").replace("AX", "")
+        if role:
+            label = f"{label}:{role}"
+        draw.rectangle((x, y, x + w, y + h), outline=(255, 60, 60, 230), width=2)
+        text_box = draw.textbbox((x, y), label, font=font)
+        pad = 2
+        draw.rectangle(
+            (text_box[0] - pad, text_box[1] - pad, text_box[2] + pad, text_box[3] + pad),
+            fill=(255, 60, 60, 210),
+        )
+        draw.text((x, y), label, fill=(255, 255, 255, 255), font=font)
+        drawn += 1
+
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    image.save(out)
+    return {"path": str(out), "format": "png", "boxes": drawn, "limit": limit, "source": str(image_path)}
+
+
+def draw_svg_annotations(image_path: str | Path, out_path: str | Path, nodes: list[dict[str, Any]], limit: int = 80) -> dict[str, Any]:
+    import html
+
+    boxes = []
+    max_x = 1.0
+    max_y = 1.0
+    for node in nodes:
+        if len(boxes) >= limit:
+            break
+        frame = node.get("frame")
+        if not isinstance(frame, dict):
+            continue
+        try:
+            x = float(frame["x"])
+            y = float(frame["y"])
+            w = float(frame["width"])
+            h = float(frame["height"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if w <= 3 or h <= 3:
+            continue
+        label = str(node.get("id") or "")
+        role = str(node.get("role") or "").replace("AX", "")
+        if role:
+            label = f"{label}:{role}"
+        max_x = max(max_x, x + w)
+        max_y = max(max_y, y + h)
+        boxes.append((x, y, w, h, label))
+
+    out = Path(out_path)
+    if out.suffix.lower() == ".png":
+        out = out.with_suffix(".svg")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    href = Path(image_path).resolve().as_uri()
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{max_x:.0f}" height="{max_y:.0f}" viewBox="0 0 {max_x:.0f} {max_y:.0f}">',
+        f'<image href="{html.escape(href)}" x="0" y="0" width="{max_x:.0f}" height="{max_y:.0f}" preserveAspectRatio="xMinYMin meet"/>',
+    ]
+    for x, y, w, h, label in boxes:
+        safe = html.escape(label)
+        parts.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{w:.1f}" height="{h:.1f}" fill="none" stroke="#ff3b30" stroke-width="2"/>')
+        parts.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{max(24, len(label) * 7):.1f}" height="17" fill="#ff3b30" opacity="0.88"/>')
+        parts.append(f'<text x="{x + 3:.1f}" y="{y + 12:.1f}" fill="white" font-size="12" font-family="monospace">{safe}</text>')
+    parts.append("</svg>")
+    out.write_text("\n".join(parts), encoding="utf-8")
+    return {"path": str(out), "format": "svg", "boxes": len(boxes), "limit": limit, "source": str(image_path)}
+
+
+def capture_state(args: argparse.Namespace) -> dict[str, Any]:
+    if args.surface == "mac":
+        cmd = mac_args(args) + ["get-state", "--max-depth", str(args.max_depth), "--max-nodes", str(args.max_nodes)]
+        if args.app:
+            cmd.extend(["--app", args.app])
+        if args.bundle_id:
+            cmd.extend(["--bundle-id", args.bundle_id])
+        if args.pid:
+            cmd.extend(["--pid", str(args.pid)])
+        if args.copy_screenshot:
+            cmd.extend(["--copy-screenshot", args.copy_screenshot])
+        if args.copy_screenshot_default:
+            cmd.append("--copy-screenshot-default")
+        payload = run_json(cmd, timeout=40)
+        payload["surface"] = "mac"
+        return payload
+
+    snapshot = run_json(windows_global_args(args) + ["snapshot", "--output", "compact"], timeout=30)
+    screenshot_info: dict[str, Any] | None = None
+    if args.copy_screenshot or args.copy_screenshot_default:
+        DEFAULT_RUN_DIR.mkdir(parents=True, exist_ok=True)
+        win_path = rf"C:\Users\ngoka\OpenClawTools\computer-state-{uuid.uuid4().hex}.png"
+        win_name = PureWindowsPath(win_path).name
+        local_path = Path(args.copy_screenshot) if args.copy_screenshot else DEFAULT_RUN_DIR / win_name
+        run_text([str(WINCONTROL), "-Action", "screenshot", "-Out", win_path], timeout=20)
+        mounted = Path("/mnt/c/Users/ngoka/OpenClawTools") / win_name
+        if mounted.exists():
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(mounted, local_path)
+            screenshot_info = {"windowsPath": win_path, "localPath": str(local_path), "bytes": local_path.stat().st_size}
+        else:
+            screenshot_info = {"windowsPath": win_path, "localPath": None, "error": "mounted screenshot missing"}
+
+    original_text = normalize_win_snapshot_text(str(snapshot.get("text") or ""))
+    text, truncated, original_len = truncate_text(original_text, args.max_chars)
+    return {
+        "ok": bool(snapshot.get("ok")),
+        "surface": "win",
+        "stateModel": "windows-mcp-snapshot+screenshot",
+        "capturedAt": int(time.time()),
+        "server": snapshot.get("server"),
+        "screenshot": screenshot_info,
+        "snapshotText": text,
+        "snapshotChars": len(text),
+        "originalSnapshotChars": original_len,
+        "truncated": truncated,
+    }
+
+
 def command_surfaces(args: argparse.Namespace) -> int:
     print_json(
         {
@@ -135,7 +334,9 @@ def command_tools(args: argparse.Namespace) -> int:
                 "list-apps",
                 "app",
                 "get-state",
+                "annotate-state",
                 "find",
+                "act",
                 "click",
                 "set-value",
                 "type-into",
@@ -219,54 +420,39 @@ def command_app(args: argparse.Namespace) -> int:
 
 
 def command_get_state(args: argparse.Namespace) -> int:
-    if args.surface == "mac":
-        cmd = mac_args(args) + ["get-state", "--max-depth", str(args.max_depth), "--max-nodes", str(args.max_nodes)]
-        if args.app:
-            cmd.extend(["--app", args.app])
-        if args.bundle_id:
-            cmd.extend(["--bundle-id", args.bundle_id])
-        if args.pid:
-            cmd.extend(["--pid", str(args.pid)])
-        if args.copy_screenshot:
-            cmd.extend(["--copy-screenshot", args.copy_screenshot])
-        if args.copy_screenshot_default:
-            cmd.append("--copy-screenshot-default")
-        print_json(run_json(cmd, timeout=40))
-        return 0
+    payload = capture_state(args)
+    if args.diff_from:
+        payload["stateDiff"] = compute_state_diff(read_json_file(args.diff_from), payload, args.diff_limit)
+    if args.save_state:
+        write_json_file(args.save_state, payload)
+        payload["savedState"] = args.save_state
+    print_json(payload)
+    return 0 if payload.get("ok") else 1
 
-    snapshot = run_json(windows_global_args(args) + ["snapshot", "--output", "compact"], timeout=30)
-    screenshot_info: dict[str, Any] | None = None
-    if args.copy_screenshot or args.copy_screenshot_default:
-        DEFAULT_RUN_DIR.mkdir(parents=True, exist_ok=True)
-        win_path = rf"C:\Users\ngoka\OpenClawTools\computer-state-{uuid.uuid4().hex}.png"
-        win_name = PureWindowsPath(win_path).name
-        local_path = Path(args.copy_screenshot) if args.copy_screenshot else DEFAULT_RUN_DIR / win_name
-        run_text([str(WINCONTROL), "-Action", "screenshot", "-Out", win_path], timeout=20)
-        mounted = Path("/mnt/c/Users/ngoka/OpenClawTools") / win_name
-        if mounted.exists():
-            local_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(mounted, local_path)
-            screenshot_info = {"windowsPath": win_path, "localPath": str(local_path), "bytes": local_path.stat().st_size}
-        else:
-            screenshot_info = {"windowsPath": win_path, "localPath": None, "error": "mounted screenshot missing"}
 
-    original_text = normalize_win_snapshot_text(str(snapshot.get("text") or ""))
-    text, truncated, original_len = truncate_text(original_text, args.max_chars)
-    print_json(
-        {
-            "ok": bool(snapshot.get("ok")),
-            "surface": "win",
-            "stateModel": "windows-mcp-snapshot+screenshot",
-            "capturedAt": int(time.time()),
-            "server": snapshot.get("server"),
-            "screenshot": screenshot_info,
-            "snapshotText": text,
-            "snapshotChars": len(text),
-            "originalSnapshotChars": original_len,
-            "truncated": truncated,
-        }
-    )
-    return 0 if snapshot.get("ok") else 1
+def command_annotate_state(args: argparse.Namespace) -> int:
+    args.copy_screenshot_default = True
+    payload = capture_state(args)
+    screenshot = payload.get("screenshot")
+    source_path = None
+    if isinstance(screenshot, dict):
+        source_path = screenshot.get("localPath")
+    if not source_path and isinstance(payload.get("screenshotPath"), str):
+        source_path = payload.get("screenshotPath")
+    if not source_path and isinstance(payload.get("path"), str):
+        source_path = payload.get("path")
+    if not source_path:
+        raise CliError("state capture did not include a local screenshot path")
+    nodes = payload.get("nodes") if isinstance(payload.get("nodes"), list) else []
+    if not nodes and isinstance(payload.get("accessibility"), dict):
+        nested_nodes = payload["accessibility"].get("nodes")
+        if isinstance(nested_nodes, list):
+            nodes = nested_nodes
+    if args.surface != "mac":
+        raise CliError("annotated boxes currently require Mac AX frames; Windows returns screenshot metadata only")
+    annotation = draw_annotations(source_path, args.out, [node for node in nodes if isinstance(node, dict)], args.limit)
+    print_json({"ok": True, "surface": args.surface, "state": payload, "annotation": annotation})
+    return 0
 
 
 def command_find(args: argparse.Namespace) -> int:
@@ -300,6 +486,95 @@ def command_find(args: argparse.Namespace) -> int:
     payload["surface"] = "win"
     print_json(payload)
     return 0
+
+
+def state_contains(payload: dict[str, Any], query: str) -> bool:
+    needle = query.lower()
+    return any(needle in line.lower() for line in state_lines(payload))
+
+
+def run_action_once(args: argparse.Namespace) -> dict[str, Any]:
+    action = args.action
+    cmd = [str(Path(__file__).resolve()), action, "--surface", args.surface]
+    if args.host:
+        cmd.extend(["--host", args.host])
+    if args.endpoint:
+        cmd.extend(["--endpoint", args.endpoint])
+    if args.ledger_run:
+        cmd.extend(["--ledger-run", args.ledger_run])
+    if args.allow_sensitive:
+        cmd.append("--allow-sensitive")
+    for name, flag in (("app", "--app"), ("bundle_id", "--bundle-id"), ("pid", "--pid")):
+        value = getattr(args, name, None)
+        if value is not None:
+            cmd.extend([flag, str(value)])
+    for name, flag in (
+        ("id", "--id"),
+        ("query", "--query"),
+        ("role", "--role"),
+        ("label", "--label"),
+        ("x", "--x"),
+        ("y", "--y"),
+        ("x1", "--x1"),
+        ("y1", "--y1"),
+        ("x2", "--x2"),
+        ("y2", "--y2"),
+        ("dx", "--dx"),
+        ("dy", "--dy"),
+        ("button", "--button"),
+        ("clicks", "--clicks"),
+        ("key", "--key"),
+        ("text", "--text"),
+        ("ax_action", "--action"),
+    ):
+        value = getattr(args, name, None)
+        if value is not None:
+            cmd.extend([flag, str(value)])
+    if getattr(args, "clear", False):
+        cmd.append("--clear")
+    if getattr(args, "enter", False):
+        cmd.append("--enter")
+    return run_json(cmd, timeout=60)
+
+
+def command_act(args: argparse.Namespace) -> int:
+    if args.action not in {"click", "set-value", "type-into", "type-text", "press-key", "scroll", "drag", "perform-action"}:
+        raise CliError(f"unsupported act action: {args.action}")
+    before = capture_state(args)
+    attempts = []
+    ok = False
+    after: dict[str, Any] = before
+    for attempt in range(1, args.retries + 2):
+        action_result = run_action_once(args)
+        time.sleep(max(args.settle_ms, 0) / 1000)
+        after = capture_state(args)
+        expectation_ok = True if not args.expect else state_contains(after, args.expect)
+        attempt_payload = {
+            "attempt": attempt,
+            "action": action_result,
+            "expectation": {"query": args.expect, "ok": expectation_ok} if args.expect else None,
+            "stateDiff": compute_state_diff(before if attempt == 1 else attempts[-1]["afterState"], after, args.diff_limit),
+            "afterState": after,
+        }
+        attempts.append(attempt_payload)
+        if action_result.get("ok", True) and expectation_ok:
+            ok = True
+            break
+    response = {
+        "ok": ok,
+        "surface": args.surface,
+        "action": args.action,
+        "attempts": [
+            {k: v for k, v in attempt.items() if args.include_states or k != "afterState"}
+            for attempt in attempts
+        ],
+        "stateDiff": compute_state_diff(before, after, args.diff_limit),
+    }
+    if args.include_states:
+        response["beforeState"] = before
+        response["afterState"] = after
+    print_json(response)
+    return 0 if ok else 1
 
 
 def command_click(args: argparse.Namespace) -> int:
@@ -603,7 +878,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-chars", type=int, default=20000, help="Windows snapshot text character cap; 0 means unlimited")
     p.add_argument("--copy-screenshot")
     p.add_argument("--copy-screenshot-default", action="store_true")
+    p.add_argument("--save-state", help="Write the captured state JSON to this path for later diffing")
+    p.add_argument("--diff-from", help="Compare this capture against a previously saved state JSON")
+    p.add_argument("--diff-limit", type=int, default=40)
     p.set_defaults(func=command_get_state)
+
+    p = sub.add_parser("annotate-state")
+    add_surface(p)
+    add_target(p)
+    p.add_argument("--out", required=True)
+    p.add_argument("--limit", type=int, default=80)
+    p.add_argument("--max-depth", type=int, default=5)
+    p.add_argument("--max-nodes", type=int, default=300)
+    p.add_argument("--max-chars", type=int, default=20000)
+    p.add_argument("--copy-screenshot")
+    p.add_argument("--copy-screenshot-default", action="store_true")
+    p.set_defaults(func=command_annotate_state)
 
     p = sub.add_parser("find")
     add_surface(p)
@@ -613,6 +903,41 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=20)
     p.add_argument("--max-match-chars", type=int, default=500, help="Windows per-match character cap; 0 means unlimited")
     p.set_defaults(func=command_find)
+
+    p = sub.add_parser("act")
+    add_surface(p)
+    add_target(p)
+    p.add_argument("action", choices=["click", "set-value", "type-into", "type-text", "press-key", "scroll", "drag", "perform-action"])
+    p.add_argument("--id", type=int)
+    p.add_argument("--query")
+    p.add_argument("--role")
+    p.add_argument("--label")
+    p.add_argument("--x", type=float)
+    p.add_argument("--y", type=float)
+    p.add_argument("--x1", type=float)
+    p.add_argument("--y1", type=float)
+    p.add_argument("--x2", type=float)
+    p.add_argument("--y2", type=float)
+    p.add_argument("--dx", type=int)
+    p.add_argument("--dy", type=int)
+    p.add_argument("--button", choices=["left", "right", "middle"])
+    p.add_argument("--clicks", type=int)
+    p.add_argument("--key")
+    p.add_argument("--text")
+    p.add_argument("--ax-action", dest="ax_action")
+    p.add_argument("--clear", action="store_true")
+    p.add_argument("--enter", action="store_true")
+    p.add_argument("--expect", help="Query that must appear in the post-action state")
+    p.add_argument("--retries", type=int, default=1)
+    p.add_argument("--settle-ms", type=int, default=250)
+    p.add_argument("--diff-limit", type=int, default=40)
+    p.add_argument("--include-states", action="store_true")
+    p.add_argument("--max-depth", type=int, default=5)
+    p.add_argument("--max-nodes", type=int, default=300)
+    p.add_argument("--max-chars", type=int, default=20000)
+    p.add_argument("--copy-screenshot")
+    p.add_argument("--copy-screenshot-default", action="store_true")
+    p.set_defaults(func=command_act)
 
     p = sub.add_parser("click")
     add_surface(p)

@@ -93,8 +93,28 @@ TOOLS: list[dict[str, Any]] = [
                 "max_chars": {"type": "integer", "default": 20000, "description": "Windows snapshot text character cap; 0 means unlimited."},
                 "copy_screenshot": {"type": "string", "description": "Optional local path for screenshot copy."},
                 "copy_screenshot_default": {"type": "boolean", "default": False},
+                "save_state": {"type": "string", "description": "Optional path to save the captured state JSON for later diffing."},
+                "diff_from": {"type": "string", "description": "Optional previous state JSON path to diff against."},
+                "diff_limit": {"type": "integer", "default": 40},
                 **GLOBAL,
             }
+        ),
+    },
+    {
+        "name": "computer_annotate_state",
+        "description": "Capture a screenshot and draw Mac Accessibility element boxes/ids on top for visual grounding.",
+        "inputSchema": schema_object(
+            {
+                "surface": SURFACE,
+                **MAC_TARGET,
+                "out": {"type": "string", "description": "Local annotated PNG output path."},
+                "limit": {"type": "integer", "default": 80},
+                "max_depth": {"type": "integer", "default": 5},
+                "max_nodes": {"type": "integer", "default": 300},
+                "max_chars": {"type": "integer", "default": 20000},
+                **GLOBAL,
+            },
+            ["out"],
         ),
     },
     {
@@ -111,6 +131,49 @@ TOOLS: list[dict[str, Any]] = [
                 **GLOBAL,
             },
             ["query"],
+        ),
+    },
+    {
+        "name": "computer_act",
+        "description": "Run a GUI action with before/after state diff, optional expectation check, and bounded retry.",
+        "inputSchema": schema_object(
+            {
+                "surface": SURFACE,
+                **MAC_TARGET,
+                "action": {
+                    "type": "string",
+                    "enum": ["click", "set-value", "type-into", "type-text", "press-key", "scroll", "drag", "perform-action"],
+                },
+                "id": {"type": "integer", "description": "Mac AX element id."},
+                "query": {"type": "string", "description": "Semantic query for target/action."},
+                "role": {"type": "string", "description": "Optional Mac AX role filter."},
+                "label": {"type": "integer", "description": "Windows numeric annotation label."},
+                "x": {"type": "number"},
+                "y": {"type": "number"},
+                "x1": {"type": "number"},
+                "y1": {"type": "number"},
+                "x2": {"type": "number"},
+                "y2": {"type": "number"},
+                "dx": {"type": "integer"},
+                "dy": {"type": "integer"},
+                "button": {"type": "string", "enum": ["left", "right", "middle"]},
+                "clicks": {"type": "integer"},
+                "key": {"type": "string"},
+                "text": {"type": "string"},
+                "ax_action": {"type": "string", "description": "Mac AX action name for perform-action, for example AXPress."},
+                "clear": {"type": "boolean", "default": False},
+                "enter": {"type": "boolean", "default": False},
+                "expect": {"type": "string", "description": "Query that must appear after the action."},
+                "retries": {"type": "integer", "default": 1},
+                "settle_ms": {"type": "integer", "default": 250},
+                "diff_limit": {"type": "integer", "default": 40},
+                "include_states": {"type": "boolean", "default": False},
+                "max_depth": {"type": "integer", "default": 5},
+                "max_nodes": {"type": "integer", "default": 300},
+                "max_chars": {"type": "integer", "default": 20000},
+                **GLOBAL,
+            },
+            ["action"],
         ),
     },
     {
@@ -375,6 +438,23 @@ def run_computer_state(command: str, args: dict[str, Any]) -> dict[str, Any]:
             cmd.extend(["--copy-screenshot", str(args["copy_screenshot"])])
         if args.get("copy_screenshot_default"):
             cmd.append("--copy-screenshot-default")
+        if args.get("save_state"):
+            cmd.extend(["--save-state", str(args["save_state"])])
+        if args.get("diff_from"):
+            cmd.extend(["--diff-from", str(args["diff_from"])])
+        if args.get("diff_limit") is not None:
+            cmd.extend(["--diff-limit", str(args["diff_limit"])])
+    elif command == "annotate-state":
+        add_mac_target(cmd, args)
+        cmd.extend(["--out", str(args["out"])])
+        for key, flag in (
+            ("limit", "--limit"),
+            ("max_depth", "--max-depth"),
+            ("max_nodes", "--max-nodes"),
+            ("max_chars", "--max-chars"),
+        ):
+            if args.get(key) is not None:
+                cmd.extend([flag, str(args[key])])
     elif command == "find":
         add_mac_target(cmd, args)
         cmd.extend(["--query", str(args["query"])])
@@ -384,6 +464,43 @@ def run_computer_state(command: str, args: dict[str, Any]) -> dict[str, Any]:
             cmd.extend(["--limit", str(args["limit"])])
         if args.get("max_match_chars") is not None:
             cmd.extend(["--max-match-chars", str(args["max_match_chars"])])
+    elif command == "act":
+        add_mac_target(cmd, args)
+        cmd.append(str(args["action"]))
+        for key, flag in (
+            ("id", "--id"),
+            ("query", "--query"),
+            ("role", "--role"),
+            ("label", "--label"),
+            ("x", "--x"),
+            ("y", "--y"),
+            ("x1", "--x1"),
+            ("y1", "--y1"),
+            ("x2", "--x2"),
+            ("y2", "--y2"),
+            ("dx", "--dx"),
+            ("dy", "--dy"),
+            ("button", "--button"),
+            ("clicks", "--clicks"),
+            ("key", "--key"),
+            ("text", "--text"),
+            ("ax_action", "--ax-action"),
+            ("expect", "--expect"),
+            ("retries", "--retries"),
+            ("settle_ms", "--settle-ms"),
+            ("diff_limit", "--diff-limit"),
+            ("max_depth", "--max-depth"),
+            ("max_nodes", "--max-nodes"),
+            ("max_chars", "--max-chars"),
+        ):
+            if args.get(key) is not None:
+                cmd.extend([flag, str(args[key])])
+        if args.get("clear"):
+            cmd.append("--clear")
+        if args.get("enter"):
+            cmd.append("--enter")
+        if args.get("include_states"):
+            cmd.append("--include-states")
     elif command == "click":
         add_mac_target(cmd, args)
         if args.get("id") is not None:
@@ -515,7 +632,9 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         "computer_list_apps": "list-apps",
         "computer_app": "app",
         "computer_get_state": "get-state",
+        "computer_annotate_state": "annotate-state",
         "computer_find": "find",
+        "computer_act": "act",
         "computer_click": "click",
         "computer_set_value": "set-value",
         "computer_type_into": "type-into",
