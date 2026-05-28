@@ -1,62 +1,351 @@
+<div align="center">
+
 # OpenClaw Computer State
 
-Unified state-first desktop control facade for OpenClaw agents.
+**State-first desktop control for OpenClaw agents across macOS and Windows.**
 
-This repository packages the Mac and Windows control harness used by OpenClaw to expose a single `computer_state` MCP surface:
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Platform: macOS](https://img.shields.io/badge/platform-macOS-black.svg)](#surfaces)
+[![Platform: Windows](https://img.shields.io/badge/platform-Windows-0078D4.svg)](#surfaces)
+[![MCP](https://img.shields.io/badge/MCP-tools-blue.svg)](#mcp-tools)
+[![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#status)
 
-- macOS: screenshot + Accessibility tree through a persistent `MacControl.app` on `macbox`
-- Windows: Windows-MCP semantic snapshots plus Win32 mouse/keyboard/screenshot helpers
-- MCP: `scripts/computer-state-mcp` exposes the unified command vocabulary to Codex/OpenClaw agents
+Give an agent a real UI state, let it act, then verify what changed.
 
-## Tools
+</div>
 
-The MCP server exposes:
+---
 
-- `computer_surfaces`
-- `computer_healthcheck`
-- `computer_list_apps`
-- `computer_app`
-- `computer_get_state`
-- `computer_annotate_state`
-- `computer_find`
-- `computer_act`
-- `computer_replay_workflow`
-- `computer_click`
-- `computer_set_value`
-- `computer_type_into`
-- `computer_perform_action`
-- `computer_select_text`
-- `computer_run_applescript`
-- `computer_type_text`
-- `computer_press_key`
-- `computer_scroll`
-- `computer_drag`
-- `computer_wait_for`
+## TL;DR
 
-## Quick Smoke
+OpenClaw Computer State packages the desktop-control layer used by OpenClaw to inspect and operate real machines through one MCP vocabulary.
+
+It combines:
+
+- macOS screenshots, Accessibility trees, AX actions, AppleScript, app/window control
+- Windows semantic snapshots, UI actions, screenshots, Win32 mouse/keyboard helpers
+- state diffing to avoid repeatedly dumping huge UI trees into an agent context
+- action wrappers that capture before/after state, verify expectations, and retry boundedly
+- workflow replay so repeated GUI procedures become auditable JSON recipes
+- a cross-surface eval suite for Mac and Windows control health
 
 ```bash
-python3 -m py_compile scripts/computer-state scripts/computer-state-mcp scripts/maccomputer
+git clone git@github.com:kiyo9w/openclaw-computer-state.git
+cd openclaw-computer-state
+
+python3 -m py_compile scripts/computer-state scripts/computer-state-mcp scripts/computer-workflow
 scripts/computer-state surfaces
 scripts/computer-state healthcheck --surface mac
 scripts/computer-state healthcheck --surface win
-scripts/computer-state get-state --surface win --save-state /tmp/before.json
-scripts/computer-state get-state --surface win --diff-from /tmp/before.json
-scripts/computer-workflow replay --file examples/workflows/win-esc-smoke.json --report /tmp/workflow-report.json
 scripts/eval-computer-state
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | scripts/computer-state-mcp
 ```
 
-## OpenClaw MCP Config
+---
 
-Add this server to `mcp.servers` in OpenClaw config:
+## Why This Exists
+
+Desktop agents fail when they click blind.
+
+OpenClaw already had strong primitives for controlling macOS and Windows, but they lived behind separate commands and mental models:
+
+- `scripts/maccontrol`
+- `scripts/maccomputer`
+- `scripts/wincontrol`
+- `scripts/windows-mcp-call`
+
+This repo turns those primitives into a single state-first facade:
+
+1. Capture the current UI state.
+2. Find semantic targets when possible.
+3. Act through a bounded wrapper.
+4. Return a compact diff and verification result.
+5. Replay known workflows instead of rediscovering the same UI every time.
+
+The goal is not to be a giant computer-use framework. The goal is a small, inspectable layer that gives agents enough state, safety, and repeatability to operate real desktops without turning every task into guesswork.
+
+---
+
+## Surfaces
+
+| Surface | Backend | State Model | Action Model |
+|---|---|---|---|
+| `mac` | `scripts/maccomputer` -> `MacControl.app` on `macbox` | screenshot + macOS Accessibility tree | AX press/set/select, mouse, keyboard, AppleScript, app/window helpers |
+| `win` | `scripts/windows-mcp-call` + `scripts/wincontrol` | Windows-MCP semantic snapshot + optional screenshot | label/coordinate click, type, shortcuts, scroll, drag, app/window helpers |
+
+Both surfaces are exposed through:
+
+- CLI: `scripts/computer-state`
+- MCP stdio server: `scripts/computer-state-mcp`
+- workflow runner: `scripts/computer-workflow`
+
+---
+
+## Features
+
+- **State-first capture**: screenshot metadata plus a semantic tree where available.
+- **Bounded context output**: Windows snapshots and find results are capped by default to avoid context overflow.
+- **Semantic targeting**: prefer AX ids, queries, roles, labels, and UI tree matches before raw coordinates.
+- **Visual grounding**: `annotate-state` draws Accessibility ids and roles onto screenshots on macOS, with SVG fallback when Pillow is unavailable.
+- **State diffing**: save state snapshots and compare later captures as compact added/removed line deltas.
+- **Action repair loop**: `act` captures before/after state, verifies expected UI text, and retries within a small bound.
+- **Workflow replay**: JSON workflows replay through `act`, so every step still gets diff, verification, and retry.
+- **MCP tool surface**: agents can call the same capabilities through structured MCP tools.
+- **Cross-surface evals**: one command checks syntax, MCP listing, Mac health, Windows health, state diff, action loop, workflow replay, and annotation.
+- **Safety stance**: risky GUI actions still require explicit confirmation by the calling agent/operator.
+
+---
+
+## Architecture
+
+```text
++-------------------------------------------------------------+
+| Agent / Codex / OpenClaw                                    |
+|                                                             |
+|  MCP tools                                                  |
+|  `-- scripts/computer-state-mcp                             |
+|        |                                                    |
+|        v                                                    |
+|  Unified facade                                             |
+|  `-- scripts/computer-state                                 |
+|        |-- get-state                                        |
+|        |-- find                                             |
+|        |-- act                                              |
+|        |-- annotate-state                                   |
+|        `-- wait-for                                         |
+|                                                             |
+|  Workflow layer                                             |
+|  `-- scripts/computer-workflow                              |
+|        `-- replay JSON steps through computer-state act     |
++-------------------------------------------------------------+
+            |                                      |
+            v                                      v
++-----------------------------+      +------------------------------+
+| macOS surface               |      | Windows surface              |
+| scripts/maccomputer         |      | scripts/windows-mcp-call     |
+| MacControl.app              |      | scripts/wincontrol           |
+| AX tree + screenshot        |      | MCP snapshot + Win32 helpers |
++-----------------------------+      +------------------------------+
+```
+
+---
+
+## Quickstart
+
+### 1. Check available surfaces
+
+```bash
+scripts/computer-state surfaces
+scripts/computer-state tools
+```
+
+### 2. Run healthchecks
+
+```bash
+scripts/computer-state healthcheck --surface mac
+scripts/computer-state healthcheck --surface win
+```
+
+### 3. Capture UI state
+
+```bash
+scripts/computer-state get-state --surface mac --app "ChatGPT Atlas" --copy-screenshot-default
+scripts/computer-state get-state --surface win --copy-screenshot-default --max-chars 20000
+```
+
+### 4. Find a target
+
+```bash
+scripts/computer-state find --surface mac --app "ChatGPT Atlas" --query Help --role MenuBarItem
+scripts/computer-state find --surface win --query "Message" --limit 5
+```
+
+### 5. Act with verification
+
+```bash
+scripts/computer-state act \
+  --surface mac \
+  click \
+  --app "ChatGPT Atlas" \
+  --query Help \
+  --role MenuBarItem \
+  --expect Help \
+  --retries 1
+```
+
+```bash
+scripts/computer-state act \
+  --surface win \
+  press-key \
+  --key ESC \
+  --retries 0 \
+  --max-chars 3000
+```
+
+---
+
+## State Diff
+
+Repeated full UI dumps are expensive for agents. Save a state once, then ask for the delta:
+
+```bash
+scripts/computer-state get-state \
+  --surface win \
+  --max-chars 12000 \
+  --save-state /tmp/before.json
+
+scripts/computer-state get-state \
+  --surface win \
+  --max-chars 12000 \
+  --diff-from /tmp/before.json \
+  --diff-limit 20
+```
+
+The diff reports:
+
+- added lines
+- removed lines
+- total added/removed counts
+- whether anything changed
+- before/after line counts
+
+---
+
+## Visual Grounding
+
+On macOS, generate an annotated screenshot from Accessibility frames:
+
+```bash
+scripts/computer-state annotate-state \
+  --surface mac \
+  --app "ChatGPT Atlas" \
+  --out /tmp/chatgpt-annotated.png
+```
+
+If Pillow is installed, the output is a PNG. If Pillow is not installed, the command writes an SVG overlay next to the requested PNG path.
+
+---
+
+## Workflows
+
+Use workflows when a GUI procedure is worth replaying.
+
+Workflows are JSON recipes. Each step replays through `computer-state act`, so replay still captures before/after state, returns a diff, checks expectations, and retries within a bound.
+
+### Create a workflow
+
+```bash
+scripts/computer-workflow init \
+  --file /tmp/open-repo.json \
+  --name open-repo \
+  --surface win
+
+scripts/computer-workflow add \
+  --file /tmp/open-repo.json \
+  press-key \
+  --key "CTRL+L" \
+  --step-name address-bar
+
+scripts/computer-workflow add \
+  --file /tmp/open-repo.json \
+  type-text \
+  --text "https://github.com/kiyo9w/openclaw-computer-state" \
+  --enter \
+  --expect "openclaw-computer-state" \
+  --step-name navigate
+
+scripts/computer-workflow validate --file /tmp/open-repo.json
+```
+
+### Replay a workflow
+
+```bash
+scripts/computer-workflow replay \
+  --file /tmp/open-repo.json \
+  --report /tmp/open-repo-report.json
+```
+
+### Use variables
+
+Workflow text fields support `${NAME}` placeholders:
+
+```json
+{
+  "name": "navigate",
+  "action": "type-text",
+  "args": {
+    "text": "${URL}",
+    "enter": true
+  },
+  "expect": "${EXPECT}"
+}
+```
+
+```bash
+scripts/computer-workflow replay \
+  --file /tmp/open-repo.json \
+  --var URL=https://github.com/kiyo9w/openclaw-computer-state \
+  --var EXPECT=openclaw-computer-state
+```
+
+### Built-in example
+
+```bash
+scripts/computer-workflow validate --file examples/workflows/win-esc-smoke.json
+scripts/computer-workflow replay --file examples/workflows/win-esc-smoke.json --dry-run
+scripts/computer-workflow replay --file examples/workflows/win-esc-smoke.json --report /tmp/workflow-report.json
+```
+
+---
+
+## MCP Tools
+
+`scripts/computer-state-mcp` exposes:
+
+| Tool | Purpose |
+|---|---|
+| `computer_surfaces` | List available surfaces |
+| `computer_healthcheck` | Check whether a surface is reachable |
+| `computer_list_apps` | List visible/running applications |
+| `computer_app` | Open/focus/quit Mac apps, launch/switch/resize Windows apps |
+| `computer_get_state` | Capture UI state, optionally save/diff |
+| `computer_annotate_state` | Produce annotated Mac screenshot |
+| `computer_find` | Find UI elements by query |
+| `computer_act` | Run one action with state diff, verification, and retry |
+| `computer_replay_workflow` | Replay a JSON workflow through `act` |
+| `computer_click` | Click by semantic target or coordinate |
+| `computer_set_value` | Replace target value |
+| `computer_type_into` | Focus target and type |
+| `computer_perform_action` | Perform named Mac AX action |
+| `computer_select_text` | Select target text in Mac AX text element |
+| `computer_run_applescript` | Run AppleScript through MacControl |
+| `computer_type_text` | Type into active or selected target |
+| `computer_press_key` | Press a key/chord |
+| `computer_scroll` | Scroll by deltas |
+| `computer_drag` | Drag between coordinates |
+| `computer_wait_for` | Poll until a UI query appears |
+
+Smoke test:
+
+```bash
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{}}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"computer_healthcheck","arguments":{"surface":"mac"}}}' \
+  | scripts/computer-state-mcp
+```
+
+---
+
+## OpenClaw Config
+
+Add the MCP server to `mcp.servers`:
 
 ```json
 {
   "mcp": {
     "servers": {
       "computer_state": {
-        "command": "/absolute/path/to/scripts/computer-state-mcp",
+        "command": "/absolute/path/to/openclaw-computer-state/scripts/computer-state-mcp",
         "args": []
       }
     }
@@ -64,16 +353,84 @@ Add this server to `mcp.servers` in OpenClaw config:
 }
 ```
 
-Use `openclaw config validate` after editing config by hand.
+Validate after editing config:
 
-## Safety Model
+```bash
+openclaw config validate
+```
 
-Call `computer_get_state` before GUI actions. Prefer semantic IDs, labels, or coordinates from the latest state over blind clicking.
+---
 
-Confirm before risky GUI actions such as deleting data, sending messages, installing software, changing security settings, creating keys, transmitting sensitive data, or financial/medical/account actions.
+## Eval Suite
 
-## Docs
+Run the cross-surface eval suite after any control behavior change:
+
+```bash
+scripts/eval-computer-state
+```
+
+It verifies:
+
+- Python syntax
+- MCP `tools/list`
+- Mac healthcheck
+- Windows healthcheck
+- Windows state save/diff
+- Windows `act`
+- workflow validate/dry-run/replay
+- Mac annotated state
+
+Reports are written to:
+
+```text
+.control-runs/evals/<timestamp>/report.json
+```
+
+---
+
+## Safety
+
+This repo exposes powerful local desktop control. It intentionally stays small and auditable, but it does not make unsafe actions safe by itself.
+
+Calling agents and operators must still confirm before actions that:
+
+- delete or overwrite data
+- send messages or emails
+- purchase, transfer, or submit financial information
+- change security settings
+- create, export, or transmit secrets
+- install software or run untrusted scripts
+- affect medical, legal, account, or identity workflows
+
+Use semantic targets and `get-state`/`act` verification before GUI actions. Use raw coordinates only when semantic targeting is unavailable.
+
+---
+
+## Status
+
+Alpha, but operational.
+
+Verified on the local OpenClaw Mac/Windows setup:
+
+- macOS Accessibility and screenshot capture through `MacControl.app`
+- Windows MCP snapshots through `windows-mcp`
+- Win32 screenshot/mouse/keyboard helpers
+- MCP stdio wrapper
+- workflow replay
+- cross-surface eval suite
+
+This is not a hosted computer-use product. It is a local control layer for OpenClaw deployments that already have the Mac/Windows bridge configured.
+
+---
+
+## Documentation
 
 - [Computer State](docs/COMPUTER_STATE.md)
 - [MacControl](docs/MACCONTROL.md)
 - [Windows MCP](docs/WINDOWS_MCP.md)
+
+---
+
+## License
+
+MIT. See [LICENSE](LICENSE).
