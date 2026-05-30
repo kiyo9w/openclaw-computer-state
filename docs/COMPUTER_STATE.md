@@ -33,6 +33,23 @@ scripts/computer-state get-state --surface mac --app "ChatGPT Atlas" --copy-scre
 scripts/computer-state get-state --surface win --copy-screenshot-default --max-chars 20000
 ```
 
+State captures also include structured foreground/window metadata:
+
+```bash
+scripts/computer-state foreground --surface win --expect '^Codex$'
+scripts/computer-state window-state --surface win --window '^Codex$' --copy-screenshot-default
+scripts/computer-state window-state --surface mac --app "ChatGPT Atlas" --window 'Pikachu'
+scripts/computer-state translate-point --surface win --window '^Codex$' --x 10 --y 20
+scripts/computer-state window-screenshot --surface mac --app "ChatGPT Atlas" --window 'Pikachu'
+scripts/computer-state interrupt --surface win check
+```
+
+Use these before foreground computer-use work. `foreground` catches the failure mode where the requested app is open, but a modal, VPN prompt, or another app is actually focused and will receive clicks/typing. `window-state` resolves the target title to a stable id/handle/title object and reports whether it is focused/topmost, which mirrors the upstream Codex Computer Use pattern of choosing a window before taking action.
+It also reports `occluded`, `occludingWindows`, and `occludedRatio` so agents can detect when a target window is present but covered by another window.
+For coordinate actions that pass `--window`, add `--require-visible` to block instead of clicking/typing when the target window is occluded.
+
+Compared with Codex Computer Use 26.527, this facade now has a cross-surface state/action wrapper, workflow replay, state diffs, annotated screenshots, explicit Mac/Windows MCP tools, canonical window state, window-relative coordinate translation, window-scoped screenshots, occlusion detection, a cross-surface interrupt gate, physical Escape polling, structured sensitive-action blocking, and action lifecycle ledgers. Codex still has a tighter native Windows runtime boundary, but the OpenClaw layer now carries the useful semantics across both Mac and Windows instead of only inside one app package.
+
 For context-efficient verification, save and diff state captures instead of repeatedly dumping full UI trees:
 
 ```bash
@@ -63,19 +80,32 @@ scripts/computer-state drag --surface mac --x1 400 --y1 400 --x2 700 --y2 700
 scripts/computer-state wait-for --surface mac --app "ChatGPT Atlas" --query Help --role MenuBarItem --timeout-ms 3000
 
 scripts/computer-state find --surface win --query "Message" --limit 5
-scripts/computer-state click --surface win --x 948 --y 987
+scripts/computer-state click --surface win --window '^Codex$' --require-visible --x 10 --y 20
 scripts/computer-state type-text --surface win --x 948 --y 987 --text "hello"
 scripts/computer-state scroll --surface win --dy -120 --x 948 --y 987
 scripts/computer-state drag --surface win --x1 500 --y1 500 --x2 700 --y2 700
 scripts/computer-state wait-for --surface win --query Message --timeout-ms 3000
 ```
 
+All mutable actions first check the interrupt gate. Use `interrupt set` to stop later GUI actions, `interrupt clear` to resume, and `interrupt check` to inspect file/physical-key sources:
+
+```bash
+scripts/computer-state interrupt --surface mac check
+scripts/computer-state interrupt --surface win set --reason user_requested
+scripts/computer-state interrupt --surface win clear
+```
+
+High-risk raw actions such as `applescript` and `app quit` return a structured `sensitive_action_requires_allow_sensitive` blocker unless `--allow-sensitive` is passed after explicit approval.
+
 For action-level repair loops, use `act`. It captures state before and after, returns a compact diff, optionally verifies that an expected query appears, and retries boundedly:
 
 ```bash
 scripts/computer-state act --surface mac click --app "ChatGPT Atlas" --query Help --role MenuBarItem --expect Help --retries 1
 scripts/computer-state act --surface win type-text --x 948 --y 987 --text "hello" --expect hello --retries 1
+scripts/computer-state run-log --run-id <runId>
 ```
+
+`act` returns `runId`, `startedAtMs`, `completedAtMs`, and `reportPath`. The run directory stores `events.jsonl` plus `act-report.json`, giving downstream agents a replayable lifecycle trail without dumping full state into chat.
 
 For repeatable workflows, use `computer-workflow`. This stores a small JSON recipe and replays every step through `act`, so each step still gets before/after state diff, expectation checks, and bounded retry:
 
@@ -138,6 +168,12 @@ Codex Computer Use is strong because it has a state model: screenshot plus Acces
 - `computer_healthcheck`
 - `computer_list_apps`
 - `computer_app`
+- `computer_foreground`
+- `computer_interrupt`
+- `computer_run_log`
+- `computer_window_state`
+- `computer_translate_point`
+- `computer_window_screenshot`
 - `computer_get_state`
 - `computer_annotate_state`
 - `computer_find`

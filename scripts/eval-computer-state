@@ -51,6 +51,23 @@ def case(name: str, cmd: list[str], timeout: int = 60, stdin: str | None = None)
     return {"name": name, "ok": ok, "result": result, "payload": payload}
 
 
+def case_expected(
+    name: str,
+    cmd: list[str],
+    *,
+    returncode: int,
+    error: str | None = None,
+    timeout: int = 60,
+    stdin: str | None = None,
+) -> dict[str, Any]:
+    result = run(cmd, timeout=timeout, stdin=stdin)
+    payload = parse_json(result["stdout"]) if result["stdout"].strip().startswith("{") else None
+    ok = result["returncode"] == returncode
+    if error is not None:
+        ok = ok and isinstance(payload, dict) and payload.get("error") == error
+    return {"name": name, "ok": ok, "result": result, "payload": payload}
+
+
 def main() -> int:
     RUN_DIR.mkdir(parents=True, exist_ok=True)
     before = RUN_DIR / "win-before.json"
@@ -59,15 +76,28 @@ def main() -> int:
     workflow = ROOT / "examples" / "workflows" / "win-esc-smoke.json"
     workflow_report = RUN_DIR / "workflow-report.json"
     mcp_input = '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}\n'
+    mcp_interrupt_input = '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"computer_interrupt","arguments":{"surface":"win","mode":"check"}}}\n'
+    ledger_run = "eval-act-" + time.strftime("%Y%m%d-%H%M%S")
     cases = [
         case("python syntax", ["python3", "-m", "py_compile", str(COMPUTER_STATE), str(COMPUTER_WORKFLOW), str(MCP)]),
         case("facade tools", [str(COMPUTER_STATE), "tools"]),
         case("mcp tools/list", [str(MCP)], stdin=mcp_input),
+        case("mcp interrupt check", [str(MCP)], stdin=mcp_interrupt_input),
         case("mac healthcheck", [str(COMPUTER_STATE), "healthcheck", "--surface", "mac"], timeout=40),
         case("win healthcheck", [str(COMPUTER_STATE), "healthcheck", "--surface", "win"], timeout=40),
+        case("mac interrupt check", [str(COMPUTER_STATE), "interrupt", "--surface", "mac", "check"], timeout=40),
+        case("win interrupt check", [str(COMPUTER_STATE), "interrupt", "--surface", "win", "check"], timeout=40),
+        case_expected(
+            "sensitive applescript blocked",
+            [str(COMPUTER_STATE), "applescript", "--surface", "mac", "--script", "return 1"],
+            returncode=1,
+            error="sensitive_action_requires_allow_sensitive",
+            timeout=40,
+        ),
         case("win save state", [str(COMPUTER_STATE), "get-state", "--surface", "win", "--max-chars", "3000", "--save-state", str(before)], timeout=60),
         case("win state diff", [str(COMPUTER_STATE), "get-state", "--surface", "win", "--max-chars", "3000", "--diff-from", str(before), "--diff-limit", "5"], timeout=60),
-        case("win act esc", [str(COMPUTER_STATE), "act", "--surface", "win", "press-key", "--key", "ESC", "--retries", "0", "--max-chars", "2000"], timeout=60),
+        case("win act esc", [str(COMPUTER_STATE), "act", "--surface", "win", "--ledger-run", ledger_run, "press-key", "--key", "ESC", "--retries", "0", "--max-chars", "2000"], timeout=60),
+        case("run log", [str(COMPUTER_STATE), "run-log", "--run-id", ledger_run], timeout=30),
         case("workflow validate", [str(COMPUTER_WORKFLOW), "validate", "--file", str(workflow)], timeout=30),
         case("workflow dry-run", [str(COMPUTER_WORKFLOW), "replay", "--file", str(workflow), "--dry-run"], timeout=30),
         case("workflow replay", [str(COMPUTER_WORKFLOW), "replay", "--file", str(workflow), "--report", str(workflow_report)], timeout=90),

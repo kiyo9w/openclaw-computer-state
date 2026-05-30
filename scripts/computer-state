@@ -17,10 +17,17 @@ MACCOMPUTER = WORKSPACE_ROOT / "scripts" / "maccomputer"
 WINDOWS_MCP = WORKSPACE_ROOT / "scripts" / "windows-mcp-call"
 WINCONTROL = WORKSPACE_ROOT / "scripts" / "wincontrol"
 DEFAULT_RUN_DIR = WORKSPACE_ROOT / ".control-runs" / "computer-state"
+INTERRUPT_FILE = DEFAULT_RUN_DIR / "interrupt.json"
 
 
 class CliError(Exception):
     pass
+
+
+class PayloadError(Exception):
+    def __init__(self, payload: dict[str, Any]):
+        super().__init__(str(payload.get("error") or payload))
+        self.payload = payload
 
 
 def print_json(value: Any) -> None:
@@ -59,6 +66,154 @@ def run_text(cmd: list[str], *, timeout: int = 30) -> str:
     if proc.returncode != 0:
         raise CliError((proc.stderr or proc.stdout or f"command failed: {' '.join(cmd)}").strip())
     return proc.stdout
+
+
+def require_ok(payload: dict[str, Any], action: str) -> None:
+    if payload.get("ok") is not True:
+        raise CliError(f"{action} failed: {json.dumps(payload, ensure_ascii=False)}")
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def read_interrupt_file() -> dict[str, Any] | None:
+    if not INTERRUPT_FILE.exists():
+        return None
+    try:
+        payload = json.loads(INTERRUPT_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        payload = {"reason": "interrupt_file_present"}
+    if not isinstance(payload, dict):
+        payload = {"reason": "interrupt_file_present"}
+    return {"source": "interrupt-file", **payload}
+
+
+def write_interrupt_file(reason: str) -> dict[str, Any]:
+    DEFAULT_RUN_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {"reason": reason, "createdAtMs": now_ms()}
+    INTERRUPT_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return payload
+
+
+def clear_interrupt_file() -> None:
+    try:
+        INTERRUPT_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def physical_escape_status(args: argparse.Namespace) -> dict[str, Any]:
+    try:
+        if args.surface == "win":
+            payload = json.loads(run_text([str(WINCONTROL), "-Action", "key-state", "-Keys", "Escape"], timeout=5))
+        else:
+            payload = run_json(mac_args(args) + ["key-state", "--key", "escape"], timeout=8)
+        return {"source": "physical-escape", "ok": True, "pressed": bool(payload.get("pressed")), "raw": payload}
+    except Exception as exc:  # best-effort safety signal; unavailability should not break read-only tools
+        return {"source": "physical-escape", "ok": False, "pressed": False, "error": str(exc)}
+
+
+def interrupt_status(args: argparse.Namespace) -> dict[str, Any]:
+    sources: list[dict[str, Any]] = []
+    file_status = read_interrupt_file()
+    if file_status:
+        sources.append(file_status)
+    escape_status = physical_escape_status(args)
+    if escape_status.get("pressed") or not escape_status.get("ok"):
+        sources.append(escape_status)
+    return {
+        "ok": True,
+        "surface": args.surface,
+        "interrupted": bool(file_status or escape_status.get("pressed")),
+        "sources": sources,
+    }
+
+
+def assert_not_interrupted(args: argparse.Namespace, action: str) -> None:
+    status = interrupt_status(args)
+    if status.get("interrupted"):
+        raise PayloadError(
+            {
+                "ok": False,
+                "error": "computer_use_interrupted",
+                "action": action,
+                "surface": args.surface,
+                "interrupt": status,
+            }
+        )
+
+
+def require_sensitive_approval(args: argparse.Namespace, action: str, reason: str) -> None:
+    if getattr(args, "allow_sensitive", False):
+        return
+    raise PayloadError(
+        {
+            "ok": False,
+            "error": "sensitive_action_requires_allow_sensitive",
+            "action": action,
+            "surface": args.surface,
+            "reason": reason,
+            "requiredConfirmation": "Re-run with --allow-sensitive only after explicit user approval.",
+        }
+    )
+
+
+def run_dir(run_id: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", run_id).strip("._") or "run"
+    return DEFAULT_RUN_DIR / "runs" / safe
+
+
+def redact_value(key: str, value: Any) -> Any:
+    if key in {"text", "script"} and isinstance(value, str):
+        return {"redacted": True, "chars": len(value)}
+    return value
+
+
+def args_for_log(args: argparse.Namespace) -> dict[str, Any]:
+    out = {}
+    for key, value in vars(args).items():
+        if key == "func" or value is None:
+            continue
+        out[key] = redact_value(key, value)
+    return out
+
+
+def append_run_event(args: argparse.Namespace, event: str, payload: dict[str, Any] | None = None) -> None:
+    run_id = getattr(args, "ledger_run", None)
+    if not run_id:
+        return
+    directory = run_dir(str(run_id))
+    directory.mkdir(parents=True, exist_ok=True)
+    row = {
+        "timestampMs": now_ms(),
+        "event": event,
+        "surface": getattr(args, "surface", None),
+        "command": getattr(args, "command", None),
+        "runId": str(run_id),
+    }
+    if payload:
+        row.update(payload)
+    with (directory / "events.jsonl").open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def write_run_artifact(run_id: str, name: str, payload: dict[str, Any]) -> str:
+    directory = run_dir(run_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / name
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return str(path)
+
+
+def scp_from_mac(host: str, remote_path: str, local_path: Path, timeout: int = 20) -> None:
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", f"{host}:{remote_path}", str(local_path)],
+        cwd=str(WORKSPACE_ROOT),
+        check=True,
+        timeout=timeout,
+    )
 
 
 def mac_args(args: argparse.Namespace) -> list[str]:
@@ -108,6 +263,326 @@ def truncate_text(text: str, max_chars: int, flag: str = "--max-chars") -> tuple
     suffix = f"\n...[truncated {original_len - max_chars} chars; rerun with {flag} 0 for full output]"
     keep = max(0, max_chars - len(suffix))
     return text[:keep] + suffix, True, original_len
+
+
+def png_size(path: str | Path) -> tuple[int | None, int | None]:
+    try:
+        import struct
+
+        with Path(path).open("rb") as f:
+            header = f.read(24)
+        if header.startswith(b"\x89PNG\r\n\x1a\n"):
+            return struct.unpack(">I", header[16:20])[0], struct.unpack(">I", header[20:24])[0]
+    except OSError:
+        pass
+    return None, None
+
+
+def screenshot_meta(payload: dict[str, Any], *, screenshot_id: str = "screenshot-0") -> dict[str, Any]:
+    out = dict(payload)
+    out.setdefault("id", screenshot_id)
+    out.setdefault("originX", 0)
+    out.setdefault("originY", 0)
+    out.setdefault("zIndex", 0)
+    local_path = out.get("localPath")
+    if isinstance(local_path, str) and ("width" not in out or "height" not in out):
+        width, height = png_size(local_path)
+        if width is not None:
+            out["width"] = width
+        if height is not None:
+            out["height"] = height
+    return out
+
+
+WINDOW_ROW_RE = re.compile(
+    r"^(?P<name>.*?)\s+(?P<depth>-?\d+)\s+(?P<status>\S+)\s+(?P<width>\d+)\s+(?P<height>\d+)\s+(?P<handle>\d+)\s*$"
+)
+
+
+def parse_window_rows(text: str, section: str) -> list[dict[str, Any]]:
+    marker = f"{section}:"
+    if marker not in text:
+        return []
+    after = text.split(marker, 1)[1]
+    rows: list[dict[str, Any]] = []
+    for line in after.splitlines():
+        if rows and not line.strip():
+            break
+        match = WINDOW_ROW_RE.match(line)
+        if not match:
+            continue
+        rows.append(
+            {
+                "name": match.group("name").strip(),
+                "depth": int(match.group("depth")),
+                "status": match.group("status"),
+                "width": int(match.group("width")),
+                "height": int(match.group("height")),
+                "handle": int(match.group("handle")),
+            }
+        )
+    return rows
+
+
+def windows_desktop_meta(text: str) -> dict[str, Any]:
+    focused = parse_window_rows(text, "Focused Window")
+    opened = parse_window_rows(text, "Opened Windows")
+    opened_sorted = sorted(opened, key=lambda item: item["depth"])
+    visible = sorted(focused + opened, key=lambda item: item["depth"])
+    return {
+        "focusedWindow": focused[0] if focused else None,
+        "openedWindows": opened_sorted,
+        "topWindow": visible[0] if visible else None,
+        "windowCount": len(opened),
+    }
+
+
+def canonical_window(window: dict[str, Any]) -> dict[str, Any]:
+    raw_id = window.get("handle", window.get("id", 0))
+    out = {
+        "id": int(raw_id),
+        "title": str(window.get("name") or window.get("title") or ""),
+    }
+    if "handle" in window:
+        out["handle"] = int(window["handle"])
+    if "owner" in window:
+        out["app"] = str(window.get("owner") or "")
+    if "pid" in window:
+        out["pid"] = int(window.get("pid") or 0)
+    for key in ("depth", "status", "width", "height"):
+        if key in window:
+            out[key] = window[key]
+    bounds = window.get("bounds")
+    if isinstance(bounds, dict):
+        clean_bounds = {key: (0 if isinstance(value, bool) else value) for key, value in bounds.items()}
+        out["bounds"] = clean_bounds
+        try:
+            out["width"] = float(clean_bounds.get("Width", clean_bounds.get("width")))
+            out["height"] = float(clean_bounds.get("Height", clean_bounds.get("height")))
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+def window_origin(window: dict[str, Any]) -> tuple[float, float] | None:
+    bounds = window.get("bounds")
+    if isinstance(bounds, dict):
+        x = bounds.get("X", bounds.get("x", 0))
+        y = bounds.get("Y", bounds.get("y", 0))
+        if isinstance(x, bool):
+            x = 0
+        if isinstance(y, bool):
+            y = 0
+        try:
+            return float(x), float(y)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def window_rect(window: dict[str, Any]) -> tuple[float, float, float, float] | None:
+    bounds = window.get("bounds")
+    if not isinstance(bounds, dict):
+        return None
+    try:
+        x = float(bounds.get("X", bounds.get("x")))
+        y = float(bounds.get("Y", bounds.get("y")))
+        width = float(bounds.get("Width", bounds.get("width", window.get("width"))))
+        height = float(bounds.get("Height", bounds.get("height", window.get("height"))))
+    except (TypeError, ValueError):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return (x, y, width, height)
+
+
+def rect_overlap(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    x1 = max(ax, bx)
+    y1 = max(ay, by)
+    x2 = min(ax + aw, bx + bw)
+    y2 = min(ay + ah, by + bh)
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    return (x2 - x1) * (y2 - y1)
+
+
+def clipped_overlap_rect(
+    a: tuple[float, float, float, float],
+    b: tuple[float, float, float, float],
+) -> tuple[float, float, float, float] | None:
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    x1 = max(ax, bx)
+    y1 = max(ay, by)
+    x2 = min(ax + aw, bx + bw)
+    y2 = min(ay + ah, by + bh)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return (x1, y1, x2, y2)
+
+
+def union_area(rects: list[tuple[float, float, float, float]]) -> float:
+    if not rects:
+        return 0.0
+    xs = sorted({rect[0] for rect in rects} | {rect[2] for rect in rects})
+    total = 0.0
+    for left, right in zip(xs, xs[1:]):
+        if right <= left:
+            continue
+        spans = [(top, bottom) for x1, top, x2, bottom in rects if x1 < right and x2 > left]
+        if not spans:
+            continue
+        spans.sort()
+        covered = 0.0
+        cur_top, cur_bottom = spans[0]
+        for top, bottom in spans[1:]:
+            if top > cur_bottom:
+                covered += cur_bottom - cur_top
+                cur_top, cur_bottom = top, bottom
+            else:
+                cur_bottom = max(cur_bottom, bottom)
+        covered += cur_bottom - cur_top
+        total += (right - left) * covered
+    return total
+
+
+def occlusion_info(windows: list[dict[str, Any]], selected: dict[str, Any] | None) -> dict[str, Any]:
+    if not selected:
+        return {"occluded": False, "occludingWindows": [], "occludedArea": 0, "occludedRatio": 0}
+    selected_key = selected.get("id", selected.get("handle"))
+    selected_rect = window_rect(selected)
+    if selected_rect is None or selected_key is None:
+        return {"occluded": False, "occludingWindows": [], "occludedArea": 0, "occludedRatio": 0}
+    above: list[dict[str, Any]] = []
+    overlap_rects: list[tuple[float, float, float, float]] = []
+    for window in windows:
+        if not isinstance(window, dict):
+            continue
+        window_key = window.get("id", window.get("handle"))
+        if window_key == selected_key:
+            break
+        overlap = clipped_overlap_rect(selected_rect, window_rect(window) or (0, 0, 0, 0))
+        area = ((overlap[2] - overlap[0]) * (overlap[3] - overlap[1])) if overlap else 0
+        if area > 0:
+            row = canonical_window(window)
+            row["overlapArea"] = area
+            above.append(row)
+            overlap_rects.append(overlap)
+    selected_area = selected_rect[2] * selected_rect[3]
+    occluded_area = union_area(overlap_rects)
+    return {
+        "occluded": bool(above),
+        "occludingWindows": above[:10],
+        "occludedArea": occluded_area,
+        "occludedRatio": round(min(1.0, occluded_area / selected_area), 4) if selected_area else 0,
+    }
+
+
+def with_wincontrol_bounds(windows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    try:
+        payload = json.loads(run_text([str(WINCONTROL), "-Action", "windows"], timeout=20))
+    except (CliError, json.JSONDecodeError, subprocess.TimeoutExpired):
+        return windows
+    rows = payload.get("windows") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        return windows
+    by_handle = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            by_handle[int(row.get("MainWindowHandle"))] = row
+        except (TypeError, ValueError):
+            continue
+    enriched = []
+    for win in windows:
+        item = dict(win)
+        try:
+            row = by_handle.get(int(item.get("handle", item.get("id"))))
+        except (TypeError, ValueError):
+            row = None
+        if isinstance(row, dict):
+            bounds = row.get("Bounds")
+            if isinstance(bounds, dict):
+                item["bounds"] = bounds
+            if row.get("ProcessName"):
+                item["owner"] = row.get("ProcessName")
+        enriched.append(item)
+    return enriched
+
+
+def find_windows(desktop: dict[str, Any], pattern: str) -> list[dict[str, Any]]:
+    opened = desktop.get("openedWindows")
+    if not isinstance(opened, list):
+        return []
+    return [win for win in opened if isinstance(win, dict) and window_matches(str(win.get("name") or ""), pattern)]
+
+
+def translate_window_point(args: argparse.Namespace, x: float | None, y: float | None) -> tuple[float | None, float | None, dict[str, Any] | None]:
+    if not getattr(args, "window", None) or x is None or y is None:
+        return x, y, None
+    cmd = [
+        str(Path(__file__).resolve()),
+        "window-state",
+        "--surface",
+        args.surface,
+        "--window",
+        args.window,
+        "--max-chars",
+        "8000",
+    ]
+    if getattr(args, "host", None):
+        cmd.extend(["--host", args.host])
+    if getattr(args, "endpoint", None):
+        cmd.extend(["--endpoint", args.endpoint])
+    for name, flag in (("app", "--app"), ("bundle_id", "--bundle-id"), ("pid", "--pid")):
+        value = getattr(args, name, None)
+        if value is not None:
+            cmd.extend([flag, str(value)])
+    payload = run_json(cmd, timeout=60)
+    window = payload.get("window")
+    if not isinstance(window, dict):
+        raise CliError(f"window-state did not resolve a unique window for {args.window!r}")
+    if getattr(args, "require_visible", False) and payload.get("occluded"):
+        raise PayloadError(
+            {
+                "ok": False,
+                "error": "target_window_occluded",
+                "surface": args.surface,
+                "windowPattern": args.window,
+                "occludedRatio": payload.get("occludedRatio"),
+                "occludingWindows": payload.get("occludingWindows"),
+                "windowState": payload,
+            }
+        )
+    origin = window_origin(window)
+    if origin is None:
+        raise CliError(f"resolved window has no usable bounds for relative coordinates: {args.window!r}")
+    return origin[0] + float(x), origin[1] + float(y), payload
+
+
+def find_mac_windows(windows: list[dict[str, Any]], pattern: str, args: argparse.Namespace) -> list[dict[str, Any]]:
+    matches = []
+    for win in windows:
+        if not isinstance(win, dict):
+            continue
+        if args.pid is not None and int(win.get("pid") or -1) != args.pid:
+            continue
+        if args.app and not window_matches(str(win.get("owner") or ""), args.app):
+            continue
+        haystack = " ".join([str(win.get("title") or ""), str(win.get("owner") or "")]).strip()
+        if window_matches(haystack, pattern):
+            matches.append(win)
+    return matches
+
+
+def window_matches(name: str, pattern: str) -> bool:
+    try:
+        return bool(re.search(pattern, name, re.IGNORECASE))
+    except re.error:
+        return pattern.lower() in name.lower()
 
 
 def write_json_file(path: str | Path, payload: dict[str, Any]) -> None:
@@ -357,9 +832,9 @@ def capture_state(args: argparse.Namespace) -> dict[str, Any]:
         if mounted.exists():
             local_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(mounted, local_path)
-            screenshot_info = {"windowsPath": win_path, "localPath": str(local_path), "bytes": local_path.stat().st_size}
+            screenshot_info = screenshot_meta({"windowsPath": win_path, "localPath": str(local_path), "bytes": local_path.stat().st_size})
         else:
-            screenshot_info = {"windowsPath": win_path, "localPath": None, "error": "mounted screenshot missing"}
+            screenshot_info = screenshot_meta({"windowsPath": win_path, "localPath": None, "error": "mounted screenshot missing"})
 
     original_text = normalize_win_snapshot_text(str(snapshot.get("text") or ""))
     text, truncated, original_len = truncate_text(original_text, args.max_chars)
@@ -369,6 +844,7 @@ def capture_state(args: argparse.Namespace) -> dict[str, Any]:
         "stateModel": "windows-mcp-snapshot+screenshot",
         "capturedAt": int(time.time()),
         "server": snapshot.get("server"),
+        "desktop": windows_desktop_meta(original_text),
         "screenshot": screenshot_info,
         "snapshotText": text,
         "snapshotChars": len(text),
@@ -409,6 +885,12 @@ def command_tools(args: argparse.Namespace) -> int:
                 "healthcheck",
                 "list-apps",
                 "app",
+                "foreground",
+                "interrupt",
+                "run-log",
+                "window-state",
+                "translate-point",
+                "window-screenshot",
                 "get-state",
                 "annotate-state",
                 "find",
@@ -431,6 +913,262 @@ def command_tools(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_foreground(args: argparse.Namespace) -> int:
+    if args.surface == "mac":
+        raise CliError("foreground is currently implemented for the Windows surface")
+    snapshot = run_json(windows_global_args(args) + ["snapshot", "--output", "compact"], timeout=20)
+    text = normalize_win_snapshot_text(str(snapshot.get("text") or ""))
+    desktop = windows_desktop_meta(text)
+    focused = desktop.get("focusedWindow")
+    matches = None
+    blockers = []
+    if args.expect:
+        focused_name = str(focused.get("name") if isinstance(focused, dict) else "")
+        matches = bool(focused_name and window_matches(focused_name, args.expect))
+        if not matches:
+            expected = [win for win in desktop["openedWindows"] if window_matches(str(win.get("name") or ""), args.expect)]
+            if expected:
+                blockers.append(
+                    {
+                        "type": "foreground_mismatch",
+                        "message": "Expected window is open but another window is foreground.",
+                        "expectedWindows": expected[:5],
+                    }
+                )
+            else:
+                blockers.append(
+                    {
+                        "type": "window_not_open",
+                        "message": "No open window matched the expected pattern.",
+                    }
+                )
+    print_json(
+        {
+            "ok": bool(snapshot.get("ok")) and (matches is not False),
+            "surface": "win",
+            "server": snapshot.get("server"),
+            "desktop": desktop,
+            "expect": args.expect,
+            "focusedMatchesExpect": matches,
+            "blockers": blockers,
+        }
+    )
+    return 0 if bool(snapshot.get("ok")) and (matches is not False) else 1
+
+
+def command_window_state(args: argparse.Namespace) -> int:
+    if args.surface == "mac":
+        windows_payload = run_json(mac_args(args) + ["windows"], timeout=30)
+        apps_payload = run_json(mac_args(args) + ["list-apps"], timeout=30)
+        windows = windows_payload.get("windows") if isinstance(windows_payload.get("windows"), list) else []
+        apps = apps_payload.get("apps") if isinstance(apps_payload.get("apps"), list) else []
+        active_app = next((app for app in apps if isinstance(app, dict) and app.get("active")), None)
+        active_pid = int(active_app.get("pid")) if isinstance(active_app, dict) and active_app.get("pid") is not None else None
+        matches = find_mac_windows(windows, args.window, args)
+        top = windows[0] if windows else None
+        focused = next((win for win in windows if isinstance(win, dict) and active_pid is not None and int(win.get("pid") or -1) == active_pid), None)
+        selected = matches[0] if len(matches) == 1 else None
+
+        screenshot_info: dict[str, Any] | None = None
+        if args.copy_screenshot or args.copy_screenshot_default:
+            state = capture_state(args)
+            screenshot_info = state.get("screenshot") if isinstance(state.get("screenshot"), dict) else None
+
+        result = {
+            "ok": bool(windows_payload.get("ok")) and selected is not None,
+            "surface": "mac",
+            "stateModel": "mac-window-state/cgwindowlist+screenshot",
+            "windowPattern": args.window,
+            "window": canonical_window(selected) if selected else None,
+            "matches": [canonical_window(win) for win in matches[:10]],
+            "matchCount": len(matches),
+            "isFocused": bool(
+                selected
+                and active_pid is not None
+                and int(selected.get("pid") or -1) == active_pid
+            ),
+            "isTopWindow": bool(
+                selected
+                and isinstance(top, dict)
+                and int(selected.get("id") or -1) == int(top.get("id") or -2)
+            ),
+            "focusedWindow": canonical_window(focused) if isinstance(focused, dict) else None,
+            "topWindow": canonical_window(top) if isinstance(top, dict) else None,
+            "activeApp": active_app,
+            "windows": [canonical_window(win) for win in windows[:20] if isinstance(win, dict)],
+            "windowCount": len(windows),
+            "screenshot": screenshot_info,
+            "capturedAt": int(time.time()),
+            "blockers": [],
+        }
+        result.update(occlusion_info([win for win in windows if isinstance(win, dict)], selected))
+        if len(matches) == 0:
+            result["blockers"].append({"type": "window_not_open", "message": "No open window matched the requested pattern."})
+        elif len(matches) > 1:
+            result["blockers"].append({"type": "ambiguous_window", "message": "Multiple open windows matched the requested pattern."})
+        elif result["occluded"]:
+            result["blockers"].append(
+                {
+                    "type": "window_occluded",
+                    "message": "Target window is open but partially covered by another window.",
+                    "occludingWindows": result["occludingWindows"],
+                    "occludedRatio": result["occludedRatio"],
+                }
+            )
+        print_json(result)
+        return 0 if result["ok"] else 1
+
+    payload = capture_state(args)
+    desktop = payload.get("desktop") if isinstance(payload.get("desktop"), dict) else {}
+    if isinstance(desktop.get("openedWindows"), list):
+        desktop["openedWindows"] = with_wincontrol_bounds(desktop["openedWindows"])
+    if isinstance(desktop.get("focusedWindow"), dict):
+        desktop["focusedWindow"] = with_wincontrol_bounds([desktop["focusedWindow"]])[0]
+    if isinstance(desktop.get("topWindow"), dict):
+        desktop["topWindow"] = with_wincontrol_bounds([desktop["topWindow"]])[0]
+    matches = find_windows(desktop, args.window)
+    focused = desktop.get("focusedWindow") if isinstance(desktop, dict) else None
+    top = desktop.get("topWindow") if isinstance(desktop, dict) else None
+    selected = matches[0] if len(matches) == 1 else None
+    window = canonical_window(selected) if selected else None
+
+    result = {
+        "ok": bool(payload.get("ok")) and selected is not None,
+        "surface": "win",
+        "stateModel": "windows-window-state/windows-mcp-snapshot+screenshot",
+        "windowPattern": args.window,
+        "window": window,
+        "matches": [canonical_window(win) for win in matches[:10]],
+        "matchCount": len(matches),
+        "isFocused": bool(
+            selected
+            and isinstance(focused, dict)
+            and int(focused.get("handle", -1)) == int(selected.get("handle", -2))
+        ),
+        "isTopWindow": bool(
+            selected
+            and isinstance(top, dict)
+            and int(top.get("handle", -1)) == int(selected.get("handle", -2))
+        ),
+        "focusedWindow": canonical_window(focused) if isinstance(focused, dict) else None,
+        "topWindow": canonical_window(top) if isinstance(top, dict) else None,
+        "desktop": desktop,
+        "screenshot": payload.get("screenshot"),
+        "server": payload.get("server"),
+        "capturedAt": payload.get("capturedAt"),
+        "blockers": [],
+    }
+    ordered_windows = desktop.get("openedWindows") if isinstance(desktop.get("openedWindows"), list) else []
+    result.update(occlusion_info([win for win in ordered_windows if isinstance(win, dict)], selected))
+    if len(matches) == 0:
+        result["blockers"].append({"type": "window_not_open", "message": "No open window matched the requested pattern."})
+    elif len(matches) > 1:
+        result["blockers"].append({"type": "ambiguous_window", "message": "Multiple open windows matched the requested pattern."})
+    elif result["occluded"]:
+        result["blockers"].append(
+            {
+                "type": "window_occluded",
+                "message": "Target window is open but partially covered by another window.",
+                "occludingWindows": result["occludingWindows"],
+                "occludedRatio": result["occludedRatio"],
+            }
+        )
+
+    if args.include_snapshot:
+        result["snapshotText"] = payload.get("snapshotText")
+        result["snapshotChars"] = payload.get("snapshotChars")
+        result["truncated"] = payload.get("truncated")
+
+    print_json(result)
+    return 0 if result["ok"] else 1
+
+
+def command_translate_point(args: argparse.Namespace) -> int:
+    x, y, window_state = translate_window_point(args, args.x, args.y)
+    print_json(
+        {
+            "ok": True,
+            "surface": args.surface,
+            "windowPattern": args.window,
+            "relative": {"x": args.x, "y": args.y},
+            "global": {"x": x, "y": y},
+            "windowState": window_state,
+        }
+    )
+    return 0
+
+
+def command_window_screenshot(args: argparse.Namespace) -> int:
+    state_cmd = [
+        str(Path(__file__).resolve()),
+        "window-state",
+        "--surface",
+        args.surface,
+        "--window",
+        args.window,
+        "--max-chars",
+        str(args.max_chars),
+    ]
+    if args.host:
+        state_cmd.extend(["--host", args.host])
+    if args.endpoint:
+        state_cmd.extend(["--endpoint", args.endpoint])
+    for name, flag in (("app", "--app"), ("bundle_id", "--bundle-id"), ("pid", "--pid")):
+        value = getattr(args, name, None)
+        if value is not None:
+            state_cmd.extend([flag, str(value)])
+    state = run_json(state_cmd, timeout=60)
+    window = state.get("window")
+    if not isinstance(window, dict):
+        raise CliError(f"window-state did not resolve a unique window for {args.window!r}")
+    origin = window_origin(window)
+    if origin is None:
+        raise CliError(f"resolved window has no usable bounds for screenshot: {args.window!r}")
+
+    DEFAULT_RUN_DIR.mkdir(parents=True, exist_ok=True)
+    if args.surface == "mac":
+        remote_path = f"/Users/ngotrung/OpenClawTools/maccomputer-window-{uuid.uuid4().hex}.png"
+        local_path = Path(args.out) if args.out else DEFAULT_RUN_DIR / Path(remote_path).name
+        shot = run_json(mac_args(args) + ["screenshot", "--window-id", str(window["id"]), "--out", remote_path], timeout=30)
+        require_ok(shot, "mac window screenshot")
+        scp_from_mac(args.host, remote_path, local_path)
+        screenshot = screenshot_meta(
+            {
+                "remotePath": remote_path,
+                "localPath": str(local_path),
+                "width": shot.get("width"),
+                "height": shot.get("height"),
+            },
+            screenshot_id="window-screenshot-0",
+        )
+    else:
+        win_path = rf"C:\Users\ngoka\OpenClawTools\computer-state-window-{uuid.uuid4().hex}.png"
+        win_name = PureWindowsPath(win_path).name
+        local_path = Path(args.out) if args.out else DEFAULT_RUN_DIR / win_name
+        shot = json.loads(run_text([str(WINCONTROL), "-Action", "window-screenshot", "-Handle", str(window["id"]), "-Out", win_path], timeout=30))
+        if not shot.get("ok"):
+            raise CliError(f"windows window screenshot failed: {json.dumps(shot, ensure_ascii=False)}")
+        mounted = Path("/mnt/c/Users/ngoka/OpenClawTools") / win_name
+        if not mounted.exists():
+            raise CliError(f"mounted screenshot missing: {mounted}")
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(mounted, local_path)
+        screenshot = screenshot_meta(
+            {
+                "windowsPath": win_path,
+                "localPath": str(local_path),
+                "width": shot.get("width"),
+                "height": shot.get("height"),
+                "method": shot.get("method"),
+            },
+            screenshot_id="window-screenshot-0",
+        )
+    screenshot["originX"] = origin[0]
+    screenshot["originY"] = origin[1]
+    print_json({"ok": True, "surface": args.surface, "window": window, "windowState": state, "screenshot": screenshot})
+    return 0
+
+
 def command_healthcheck(args: argparse.Namespace) -> int:
     if args.surface == "mac":
         payload = run_json(mac_args(args) + ["healthcheck"], timeout=20)
@@ -438,6 +1176,7 @@ def command_healthcheck(args: argparse.Namespace) -> int:
         return 0 if payload.get("ok") else 1
 
     snapshot = run_json(windows_global_args(args) + ["snapshot", "--output", "compact"], timeout=20)
+    text = normalize_win_snapshot_text(str(snapshot.get("text") or ""))
     ok = bool(snapshot.get("ok"))
     print_json(
         {
@@ -445,6 +1184,7 @@ def command_healthcheck(args: argparse.Namespace) -> int:
             "surface": "win",
             "server": snapshot.get("server"),
             "hasSnapshotText": bool(snapshot.get("text")),
+            "desktop": windows_desktop_meta(text),
         }
     )
     return 0 if ok else 1
@@ -467,6 +1207,8 @@ def command_list_apps(args: argparse.Namespace) -> int:
 
 
 def command_app(args: argparse.Namespace) -> int:
+    if args.mode == "quit":
+        require_sensitive_approval(args, "app quit", "Quitting an app can discard unsaved user state.")
     if args.surface == "mac":
         mode_map = {"launch": "open", "switch": "focus", "quit": "quit", "open": "open", "focus": "focus"}
         mode = mode_map.get(args.mode)
@@ -596,6 +1338,7 @@ def run_action_once(args: argparse.Namespace) -> dict[str, Any]:
         ("query", "--query"),
         ("role", "--role"),
         ("label", "--label"),
+        ("window", "--window"),
         ("x", "--x"),
         ("y", "--y"),
         ("x1", "--x1"),
@@ -617,12 +1360,18 @@ def run_action_once(args: argparse.Namespace) -> dict[str, Any]:
         cmd.append("--clear")
     if getattr(args, "enter", False):
         cmd.append("--enter")
+    if getattr(args, "require_visible", False):
+        cmd.append("--require-visible")
     return run_json(cmd, timeout=60)
 
 
 def command_act(args: argparse.Namespace) -> int:
     if args.action not in {"click", "set-value", "type-into", "type-text", "press-key", "scroll", "drag", "perform-action"}:
         raise CliError(f"unsupported act action: {args.action}")
+    run_id = args.ledger_run or uuid.uuid4().hex
+    args.ledger_run = run_id
+    started_at_ms = now_ms()
+    append_run_event(args, "act.started", {"args": args_for_log(args)})
     before = capture_state(args)
     attempts = []
     ok = False
@@ -647,6 +1396,9 @@ def command_act(args: argparse.Namespace) -> int:
         "ok": ok,
         "surface": args.surface,
         "action": args.action,
+        "runId": run_id,
+        "startedAtMs": started_at_ms,
+        "completedAtMs": now_ms(),
         "attempts": [
             {k: v for k, v in attempt.items() if args.include_states or k != "afterState"}
             for attempt in attempts
@@ -656,6 +1408,8 @@ def command_act(args: argparse.Namespace) -> int:
     if args.include_states:
         response["beforeState"] = before
         response["afterState"] = after
+    response["reportPath"] = write_run_artifact(run_id, "act-report.json", response)
+    append_run_event(args, "act.completed", {"ok": ok, "reportPath": response["reportPath"], "attempts": len(attempts)})
     print_json(response)
     return 0 if ok else 1
 
@@ -668,7 +1422,8 @@ def command_click(args: argparse.Namespace) -> int:
         elif args.query:
             cmd.extend(["--query", args.query])
         elif args.x is not None and args.y is not None:
-            cmd.extend(["--x", str(args.x), "--y", str(args.y)])
+            x, y, window_state = translate_window_point(args, args.x, args.y)
+            cmd.extend(["--x", str(x), "--y", str(y)])
         else:
             raise CliError("click requires --id, --query, or --x/--y")
         if args.role:
@@ -677,20 +1432,31 @@ def command_click(args: argparse.Namespace) -> int:
             cmd.extend(["--app", args.app])
         if args.bundle_id:
             cmd.extend(["--bundle-id", args.bundle_id])
-        print_json(run_json(cmd, timeout=20))
+        result = run_json(cmd, timeout=20)
+        if args.window and args.x is not None and args.y is not None:
+            result["coordinateMode"] = "window-relative"
+            result["windowState"] = window_state
+            result["relative"] = {"x": args.x, "y": args.y}
+        print_json(result)
         return 0
 
     if args.label:
         cmd = windows_global_args(args) + ["click", "--label", args.label, "--output", "compact"]
     elif args.x is not None and args.y is not None:
-        cmd = windows_global_args(args) + ["click", "--loc", str(int(args.x)), str(int(args.y)), "--output", "compact"]
+        x, y, window_state = translate_window_point(args, args.x, args.y)
+        cmd = windows_global_args(args) + ["click", "--loc", str(int(x)), str(int(y)), "--output", "compact"]
     else:
         raise CliError("Windows click requires --label or --x/--y")
     if args.button:
         cmd.extend(["--button", args.button])
     if args.clicks:
         cmd.extend(["--clicks", str(args.clicks)])
-    print_json(run_json(cmd, timeout=20))
+    result = run_json(cmd, timeout=20)
+    if args.window and args.x is not None and args.y is not None:
+        result["coordinateMode"] = "window-relative"
+        result["windowState"] = window_state
+        result["relative"] = {"x": args.x, "y": args.y}
+    print_json(result)
     return 0
 
 
@@ -716,12 +1482,18 @@ def command_set_value(args: argparse.Namespace) -> int:
     if args.label:
         cmd.extend(["--label", args.label])
     elif args.x is not None and args.y is not None:
-        cmd.extend(["--loc", str(int(args.x)), str(int(args.y))])
+        x, y, window_state = translate_window_point(args, args.x, args.y)
+        cmd.extend(["--loc", str(int(x)), str(int(y))])
     else:
         raise CliError("Windows set-value requires --label or --x/--y")
     if args.enter:
         cmd.append("--enter")
-    print_json(run_json(cmd, timeout=20))
+    result = run_json(cmd, timeout=20)
+    if args.window and args.x is not None and args.y is not None:
+        result["coordinateMode"] = "window-relative"
+        result["windowState"] = window_state
+        result["relative"] = {"x": args.x, "y": args.y}
+    print_json(result)
     return 0
 
 
@@ -793,6 +1565,7 @@ def command_select_text(args: argparse.Namespace) -> int:
 def command_applescript(args: argparse.Namespace) -> int:
     if args.surface != "mac":
         raise CliError("applescript is only implemented for Mac")
+    require_sensitive_approval(args, "applescript", "AppleScript can read, modify, or transmit user data through local apps.")
     print_json(run_json(mac_args(args) + ["applescript", "--script", args.script, "--timeout", str(args.timeout)], timeout=args.timeout + 5))
     return 0
 
@@ -805,14 +1578,20 @@ def command_type_text(args: argparse.Namespace) -> int:
     if args.label:
         cmd.extend(["--label", args.label])
     elif args.x is not None and args.y is not None:
-        cmd.extend(["--loc", str(int(args.x)), str(int(args.y))])
+        x, y, window_state = translate_window_point(args, args.x, args.y)
+        cmd.extend(["--loc", str(int(x)), str(int(y))])
     else:
         raise CliError("Windows type-text requires --label or --x/--y")
     if args.clear:
         cmd.append("--clear")
     if args.enter:
         cmd.append("--enter")
-    print_json(run_json(cmd, timeout=20))
+    result = run_json(cmd, timeout=20)
+    if args.window and args.x is not None and args.y is not None:
+        result["coordinateMode"] = "window-relative"
+        result["windowState"] = window_state
+        result["relative"] = {"x": args.x, "y": args.y}
+    print_json(result)
     return 0
 
 
@@ -825,56 +1604,75 @@ def command_press_key(args: argparse.Namespace) -> int:
 
 
 def command_scroll(args: argparse.Namespace) -> int:
+    x, y, window_state = translate_window_point(args, args.x, args.y)
     if args.surface == "mac":
-        print_json(run_json(mac_args(args) + ["scroll", "--dx", str(args.dx), "--dy", str(args.dy)], timeout=20))
+        result = run_json(mac_args(args) + ["scroll", "--dx", str(args.dx), "--dy", str(args.dy)], timeout=20)
+        if args.window and args.x is not None and args.y is not None:
+            result["coordinateMode"] = "window-relative"
+            result["windowState"] = window_state
+            result["relative"] = {"x": args.x, "y": args.y}
+        print_json(result)
         return 0
     cmd = [str(WINCONTROL), "-Action", "scroll", "-Dx", str(args.dx), "-Dy", str(args.dy)]
-    if args.x is not None and args.y is not None:
-        cmd.extend(["-X", str(int(args.x)), "-Y", str(int(args.y))])
-    print_json(json.loads(run_text(cmd, timeout=20)))
+    if x is not None and y is not None:
+        cmd.extend(["-X", str(int(x)), "-Y", str(int(y))])
+    result = json.loads(run_text(cmd, timeout=20))
+    if args.window and args.x is not None and args.y is not None:
+        result["coordinateMode"] = "window-relative"
+        result["windowState"] = window_state
+        result["relative"] = {"x": args.x, "y": args.y}
+    print_json(result)
     return 0
 
 
 def command_drag(args: argparse.Namespace) -> int:
+    x1, y1, window_state_1 = translate_window_point(args, args.x1, args.y1)
+    x2, y2, window_state_2 = translate_window_point(args, args.x2, args.y2)
     if args.surface == "mac":
-        print_json(
-            run_json(
-                mac_args(args)
-                + [
-                    "drag",
-                    "--x1",
-                    str(args.x1),
-                    "--y1",
-                    str(args.y1),
-                    "--x2",
-                    str(args.x2),
-                    "--y2",
-                    str(args.y2),
-                ],
-                timeout=20,
-            )
+        result = run_json(
+            mac_args(args)
+            + [
+                "drag",
+                "--x1",
+                str(x1),
+                "--y1",
+                str(y1),
+                "--x2",
+                str(x2),
+                "--y2",
+                str(y2),
+            ],
+            timeout=20,
         )
+        if args.window:
+            result["coordinateMode"] = "window-relative"
+            result["windowState"] = window_state_1 or window_state_2
+            result["relative"] = {"x1": args.x1, "y1": args.y1, "x2": args.x2, "y2": args.y2}
+        print_json(result)
         return 0
-    print_json(
-        json.loads(
-            run_text(
-                [
-                    str(WINCONTROL),
-                    "-Action",
-                    "drag",
-                    "-X",
-                    str(int(args.x1)),
-                    "-Y",
-                    str(int(args.y1)),
-                    "-X2",
-                    str(int(args.x2)),
-                    "-Y2",
-                    str(int(args.y2)),
-                ],
-                timeout=20,
-            )
+    result = json.loads(
+        run_text(
+            [
+                str(WINCONTROL),
+                "-Action",
+                "drag",
+                "-X",
+                str(int(x1)),
+                "-Y",
+                str(int(y1)),
+                "-X2",
+                str(int(x2)),
+                "-Y2",
+                str(int(y2)),
+            ],
+            timeout=20,
         )
     )
+    if args.window:
+        result["coordinateMode"] = "window-relative"
+        result["windowState"] = window_state_1 or window_state_2
+        result["relative"] = {"x1": args.x1, "y1": args.y1, "x2": args.x2, "y2": args.y2}
+    print_json(result)
     return 0
 
 
@@ -907,6 +1705,33 @@ def command_wait_for(args: argparse.Namespace) -> int:
         time.sleep(max(args.interval_ms, 50) / 1000)
     print_json({"ok": False, "surface": "win", "error": "timeout", "query": args.query, "attempts": attempts, "last": last_payload})
     return 1
+
+
+def command_interrupt(args: argparse.Namespace) -> int:
+    if args.mode == "set":
+        write_interrupt_file(args.reason)
+    elif args.mode == "clear":
+        clear_interrupt_file()
+    print_json(interrupt_status(args))
+    return 0
+
+
+def command_run_log(args: argparse.Namespace) -> int:
+    directory = run_dir(args.run_id)
+    events_path = directory / "events.jsonl"
+    events = []
+    if events_path.exists():
+        for line in events_path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                try:
+                    events.append(json.loads(line))
+                except json.JSONDecodeError:
+                    events.append({"raw": line})
+    artifacts = []
+    if directory.exists():
+        artifacts = [str(path) for path in sorted(directory.iterdir()) if path.name != "events.jsonl"]
+    print_json({"ok": directory.exists(), "runId": args.run_id, "runDir": str(directory), "events": events, "artifacts": artifacts})
+    return 0 if directory.exists() else 1
 
 
 def add_surface(parser: argparse.ArgumentParser) -> None:
@@ -953,6 +1778,39 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--window-height", type=int)
     p.set_defaults(func=command_app)
 
+    p = sub.add_parser("foreground")
+    add_surface(p)
+    p.add_argument("--expect", help="Window title regex/substr expected to be foreground")
+    p.set_defaults(func=command_foreground)
+
+    p = sub.add_parser("window-state")
+    add_surface(p)
+    add_target(p)
+    p.add_argument("--window", required=True, help="Window title regex/substr to resolve into a canonical window object")
+    p.add_argument("--max-depth", type=int, default=5)
+    p.add_argument("--max-nodes", type=int, default=300)
+    p.add_argument("--max-chars", type=int, default=20000, help="Windows snapshot text character cap; 0 means unlimited")
+    p.add_argument("--copy-screenshot")
+    p.add_argument("--copy-screenshot-default", action="store_true")
+    p.add_argument("--include-snapshot", action="store_true")
+    p.set_defaults(func=command_window_state)
+
+    p = sub.add_parser("translate-point")
+    add_surface(p)
+    add_target(p)
+    p.add_argument("--window", required=True, help="Window title regex/substr to use as coordinate origin")
+    p.add_argument("--x", type=float, required=True)
+    p.add_argument("--y", type=float, required=True)
+    p.set_defaults(func=command_translate_point)
+
+    p = sub.add_parser("window-screenshot")
+    add_surface(p)
+    add_target(p)
+    p.add_argument("--window", required=True, help="Window title regex/substr to capture")
+    p.add_argument("--out", help="Optional local output PNG path")
+    p.add_argument("--max-chars", type=int, default=8000)
+    p.set_defaults(func=command_window_screenshot)
+
     p = sub.add_parser("get-state")
     add_surface(p)
     add_target(p)
@@ -995,6 +1853,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--query")
     p.add_argument("--role")
     p.add_argument("--label")
+    p.add_argument("--window", help="Window title regex/substr; x/y are interpreted as window-relative when set")
+    p.add_argument("--require-visible", action="store_true", help="Block window-relative actions if the target window is occluded")
     p.add_argument("--x", type=float)
     p.add_argument("--y", type=float)
     p.add_argument("--x1", type=float)
@@ -1029,6 +1889,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--query")
     p.add_argument("--role")
     p.add_argument("--label")
+    p.add_argument("--window", help="Window title regex/substr; x/y are interpreted as window-relative when set")
+    p.add_argument("--require-visible", action="store_true", help="Block window-relative actions if the target window is occluded")
     p.add_argument("--x", type=float)
     p.add_argument("--y", type=float)
     p.add_argument("--button", choices=["left", "right", "middle"], default="left")
@@ -1043,6 +1905,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--query")
     p.add_argument("--role")
     p.add_argument("--label")
+    p.add_argument("--window", help="Window title regex/substr; x/y are interpreted as window-relative when set")
+    p.add_argument("--require-visible", action="store_true", help="Block window-relative actions if the target window is occluded")
     p.add_argument("--x", type=float)
     p.add_argument("--y", type=float)
     p.add_argument("--enter", action="store_true")
@@ -1056,6 +1920,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--query")
     p.add_argument("--role")
     p.add_argument("--label")
+    p.add_argument("--window", help="Window title regex/substr; x/y are interpreted as window-relative when set")
+    p.add_argument("--require-visible", action="store_true", help="Block window-relative actions if the target window is occluded")
     p.add_argument("--x", type=float)
     p.add_argument("--y", type=float)
     p.add_argument("--clear", action="store_true")
@@ -1095,6 +1961,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--label")
     p.add_argument("--x", type=float)
     p.add_argument("--y", type=float)
+    p.add_argument("--window", help="Window title regex/substr; x/y are interpreted as window-relative when set")
+    p.add_argument("--require-visible", action="store_true", help="Block window-relative actions if the target window is occluded")
     p.add_argument("--clear", action="store_true")
     p.add_argument("--enter", action="store_true")
     p.set_defaults(func=command_type_text)
@@ -1110,6 +1978,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dy", type=int, default=0)
     p.add_argument("--x", type=float)
     p.add_argument("--y", type=float)
+    p.add_argument("--window", help="Window title regex/substr; x/y are interpreted as window-relative when set")
+    p.add_argument("--require-visible", action="store_true", help="Block window-relative actions if the target window is occluded")
     p.set_defaults(func=command_scroll)
 
     p = sub.add_parser("drag")
@@ -1118,6 +1988,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--y1", type=float, required=True)
     p.add_argument("--x2", type=float, required=True)
     p.add_argument("--y2", type=float, required=True)
+    p.add_argument("--window", help="Window title regex/substr; drag coordinates are interpreted as window-relative when set")
+    p.add_argument("--require-visible", action="store_true", help="Block window-relative actions if the target window is occluded")
     p.set_defaults(func=command_drag)
 
     p = sub.add_parser("wait-for")
@@ -1129,14 +2001,51 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--interval-ms", type=int, default=250)
     p.set_defaults(func=command_wait_for)
 
+    p = sub.add_parser("interrupt")
+    add_surface(p)
+    p.add_argument("mode", choices=["check", "set", "clear"])
+    p.add_argument("--reason", default="user_requested")
+    p.set_defaults(func=command_interrupt)
+
+    p = sub.add_parser("run-log")
+    p.add_argument("--run-id", required=True)
+    p.set_defaults(func=command_run_log)
+
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
+    mutating_commands = {
+        "app",
+        "act",
+        "click",
+        "set-value",
+        "type-into",
+        "perform-action",
+        "select-text",
+        "applescript",
+        "type-text",
+        "press-key",
+        "scroll",
+        "drag",
+    }
     try:
-        return args.func(args)
+        if args.command in mutating_commands and not getattr(args, "ledger_run", None):
+            args.ledger_run = uuid.uuid4().hex
+        if args.command in mutating_commands:
+            append_run_event(args, "action.requested", {"args": args_for_log(args)})
+            assert_not_interrupted(args, args.command)
+        status = args.func(args)
+        if args.command in mutating_commands:
+            append_run_event(args, "action.completed", {"ok": status == 0, "status": status})
+        return status
+    except PayloadError as exc:
+        append_run_event(args, "action.blocked", exc.payload)
+        print_json(exc.payload)
+        return 1
     except (CliError, subprocess.TimeoutExpired) as exc:
+        append_run_event(args, "action.failed", {"ok": False, "error": str(exc)})
         print_json({"ok": False, "error": str(exc)})
         return 1
 

@@ -11,7 +11,8 @@ param(
   [string]$Keys = "",
   [string]$Path = "",
   [string]$Args = "",
-  [string]$Title = ""
+  [string]$Title = "",
+  [long]$Handle = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -26,6 +27,10 @@ public static class Win32 {
   [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hwnd, IntPtr hdcBlt, uint nFlags);
+  [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
+  public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
 }
 "@
 
@@ -49,9 +54,69 @@ switch ($Action.ToLowerInvariant()) {
     $bmp.Dispose()
     Convert-ToJsonLine @{ ok=$true; action="screenshot"; path=$Out; width=$bounds.Width; height=$bounds.Height }
   }
+  "window-screenshot" {
+    $targetHandle = [IntPtr]::Zero
+    $targetTitle = ""
+    if ($Handle -ne 0) {
+      $targetHandle = [IntPtr]$Handle
+      $p = Get-Process | Where-Object { $_.MainWindowHandle -eq $targetHandle } | Select-Object -First 1
+      if ($p) { $targetTitle = $p.MainWindowTitle }
+    } else {
+      $p = Get-Process | Where-Object { $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle -like "*$Title*" } | Select-Object -First 1
+      if (-not $p) { throw "No window matched title: $Title" }
+      $targetHandle = $p.MainWindowHandle
+      $targetTitle = $p.MainWindowTitle
+    }
+    $rect = New-Object Win32+RECT
+    if (-not [Win32]::GetWindowRect($targetHandle, [ref]$rect)) { throw "GetWindowRect failed for handle: $targetHandle" }
+    $width = $rect.Right - $rect.Left
+    $height = $rect.Bottom - $rect.Top
+    if ($width -le 0 -or $height -le 0) { throw "Invalid window bounds for handle: $targetHandle" }
+    if (-not $Out) {
+      $dir = Join-Path $env:TEMP "openclaw"
+      New-Item -ItemType Directory -Path $dir -Force | Out-Null
+      $Out = Join-Path $dir ("window-screenshot-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".png")
+    }
+    $bmp = New-Object System.Drawing.Bitmap $width, $height
+    $gfx = [System.Drawing.Graphics]::FromImage($bmp)
+    $method = "PrintWindow"
+    $hdc = $gfx.GetHdc()
+    $printed = $false
+    try {
+      $printed = [Win32]::PrintWindow($targetHandle, $hdc, 2)
+    } finally {
+      $gfx.ReleaseHdc($hdc)
+    }
+    if (-not $printed) {
+      $method = "CopyFromScreen"
+      $gfx.CopyFromScreen($rect.Left, $rect.Top, 0, 0, (New-Object System.Drawing.Size($width, $height)))
+    }
+    $bmp.Save($Out, [System.Drawing.Imaging.ImageFormat]::Png)
+    $gfx.Dispose()
+    $bmp.Dispose()
+    Convert-ToJsonLine @{ ok=$true; action="window-screenshot"; path=$Out; handle=$targetHandle.ToInt64(); title=$targetTitle; originX=$rect.Left; originY=$rect.Top; width=$width; height=$height; method=$method }
+  }
   "windows" {
-    $rows = Get-Process | Where-Object { $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle } |
-      Select-Object Id, ProcessName, MainWindowTitle, MainWindowHandle
+    $rows = Get-Process | Where-Object { $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle } | ForEach-Object {
+      $rect = New-Object Win32+RECT
+      $hasRect = [Win32]::GetWindowRect($_.MainWindowHandle, [ref]$rect)
+      $bounds = $null
+      if ($hasRect) {
+        $bounds = @{
+          X = $rect.Left
+          Y = $rect.Top
+          Width = ($rect.Right - $rect.Left)
+          Height = ($rect.Bottom - $rect.Top)
+        }
+      }
+      [PSCustomObject]@{
+        Id = $_.Id
+        ProcessName = $_.ProcessName
+        MainWindowTitle = $_.MainWindowTitle
+        MainWindowHandle = $_.MainWindowHandle
+        Bounds = $bounds
+      }
+    }
     Convert-ToJsonLine @{ ok=$true; action="windows"; windows=$rows }
   }
   "focus" {
@@ -99,6 +164,20 @@ switch ($Action.ToLowerInvariant()) {
   "hotkey" {
     [System.Windows.Forms.SendKeys]::SendWait($Keys)
     Convert-ToJsonLine @{ ok=$true; action="hotkey"; keys=$Keys }
+  }
+  "key-state" {
+    $keyMap = @{
+      "escape" = 0x1B
+      "esc" = 0x1B
+      "shift" = 0x10
+      "ctrl" = 0x11
+      "control" = 0x11
+      "alt" = 0x12
+    }
+    $keyName = $Keys.ToLowerInvariant()
+    if (-not $keyMap.ContainsKey($keyName)) { throw "Unsupported key-state key: $Keys" }
+    $pressed = (([Win32]::GetAsyncKeyState($keyMap[$keyName])) -band 0x8000) -ne 0
+    Convert-ToJsonLine @{ ok=$true; action="key-state"; key=$Keys; pressed=$pressed }
   }
   "start" {
     if (-not $Path) { throw "Missing -Path for start action" }

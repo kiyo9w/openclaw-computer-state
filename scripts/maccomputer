@@ -30,13 +30,22 @@ def run_maccontrol(args: list[str], *, host: str = DEFAULT_HOST, timeout: int = 
     if host:
         cmd.extend(["--host", host])
     cmd.extend(args)
-    proc = subprocess.run(cmd, cwd=str(WORKSPACE_ROOT), text=True, capture_output=True, timeout=timeout)
-    if proc.returncode != 0:
-        raise CliError((proc.stderr or proc.stdout or f"maccontrol failed: {cmd}").strip())
-    try:
-        payload = json.loads(proc.stdout)
-    except json.JSONDecodeError as exc:
-        raise CliError(f"maccontrol returned invalid JSON: {exc}\n{proc.stdout}") from exc
+    last_error = ""
+    for attempt in range(2):
+        proc = subprocess.run(cmd, cwd=str(WORKSPACE_ROOT), text=True, capture_output=True, timeout=timeout)
+        if proc.returncode != 0:
+            raise CliError((proc.stderr or proc.stdout or f"maccontrol failed: {cmd}").strip())
+        try:
+            payload = json.loads(proc.stdout)
+            break
+        except json.JSONDecodeError as exc:
+            last_error = f"maccontrol returned invalid JSON: {exc}\n{proc.stdout}"
+            if attempt == 0 and not proc.stdout.strip():
+                time.sleep(0.2)
+                continue
+            raise CliError(last_error) from exc
+    else:
+        raise CliError(last_error or "maccontrol returned invalid JSON")
     if not isinstance(payload, dict):
         raise CliError("maccontrol returned non-object JSON")
     return payload
@@ -74,6 +83,18 @@ def command_tools(args: argparse.Namespace) -> int:
             "name": "list-apps",
             "description": "List running Mac apps through MacControl.",
             "args": [],
+            "readOnly": True,
+        },
+        {
+            "name": "windows",
+            "description": "List visible Mac windows through CGWindowList.",
+            "args": [],
+            "readOnly": True,
+        },
+        {
+            "name": "screenshot",
+            "description": "Capture a full-screen or window-scoped Mac screenshot.",
+            "args": ["--out", "--window-id"],
             "readOnly": True,
         },
         {
@@ -143,6 +164,12 @@ def command_tools(args: argparse.Namespace) -> int:
             "readOnly": False,
         },
         {
+            "name": "key-state",
+            "description": "Check whether a physical key is currently pressed.",
+            "args": ["--key"],
+            "readOnly": True,
+        },
+        {
             "name": "scroll",
             "description": "Scroll by pixel deltas.",
             "args": ["--dx", "--dy"],
@@ -173,6 +200,21 @@ def command_tools(args: argparse.Namespace) -> int:
 
 def command_list_apps(args: argparse.Namespace) -> int:
     print_json(run_maccontrol(["app", "--action", "list"], host=args.host))
+    return 0
+
+
+def command_windows(args: argparse.Namespace) -> int:
+    print_json(run_maccontrol(["windows"], host=args.host))
+    return 0
+
+
+def command_screenshot(args: argparse.Namespace) -> int:
+    cmd = ["screenshot"]
+    if args.out:
+        cmd.extend(["--out", args.out])
+    if args.window_id is not None:
+        cmd.extend(["--window-id", str(args.window_id)])
+    print_json(run_maccontrol(cmd, host=args.host))
     return 0
 
 
@@ -220,10 +262,14 @@ def command_get_state(args: argparse.Namespace) -> int:
                 "bundleIdentifier": ax.get("bundleIdentifier"),
             },
             "screenshot": {
+                "id": "screenshot-0",
                 "remotePath": screenshot.get("path"),
                 "localPath": local_path,
                 "width": screenshot.get("width"),
                 "height": screenshot.get("height"),
+                "originX": 0,
+                "originY": 0,
+                "zIndex": 0,
             },
             "accessibility": {
                 "maxDepth": ax.get("maxDepth"),
@@ -351,6 +397,11 @@ def command_press_key(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_key_state(args: argparse.Namespace) -> int:
+    print_json(run_maccontrol(["key-state", "--key", args.key], host=args.host))
+    return 0
+
+
 def command_scroll(args: argparse.Namespace) -> int:
     print_json(run_maccontrol(["scroll", "--dx", str(args.dx), "--dy", str(args.dy)], host=args.host))
     return 0
@@ -408,6 +459,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("list-apps")
     p.set_defaults(func=command_list_apps)
+
+    p = sub.add_parser("windows")
+    p.set_defaults(func=command_windows)
+
+    p = sub.add_parser("screenshot")
+    p.add_argument("--out")
+    p.add_argument("--window-id", type=int)
+    p.set_defaults(func=command_screenshot)
 
     p = sub.add_parser("app")
     p.add_argument("mode", choices=["open", "focus", "quit"])
@@ -489,6 +548,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("press-key")
     p.add_argument("--key", required=True, help="Key combination, e.g. cmd+l, return, tab")
     p.set_defaults(func=command_press_key)
+
+    p = sub.add_parser("key-state")
+    p.add_argument("--key", required=True, help="Single key name, e.g. escape")
+    p.set_defaults(func=command_key_state)
 
     p = sub.add_parser("scroll")
     p.add_argument("--dx", type=int, default=0)

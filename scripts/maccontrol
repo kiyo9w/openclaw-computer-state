@@ -16,4 +16,35 @@ fi
 
 ARGV_JSON="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1:]))' "$@")"
 
-exec ssh -o BatchMode=yes -o ConnectTimeout=8 "$HOST" /usr/bin/python3 /Users/ngotrung/OpenClawTools/MacControl/maccontrol-client.py "$PORT" <<<"$ARGV_JSON"
+TMP_OUT="$(mktemp)"
+TMP_ERR="$(mktemp)"
+cleanup() {
+  rm -f "$TMP_OUT" "$TMP_ERR"
+}
+trap cleanup EXIT
+
+set +e
+ssh -o BatchMode=yes -o ConnectTimeout=8 "$HOST" /usr/bin/python3 /Users/ngotrung/OpenClawTools/MacControl/maccontrol-client.py "$PORT" <<<"$ARGV_JSON" >"$TMP_OUT" 2>"$TMP_ERR"
+STATUS=$?
+set -e
+if [[ "$STATUS" -eq 0 ]]; then
+  cat "$TMP_OUT"
+  exit 0
+fi
+
+if grep -q "ConnectionRefusedError" "$TMP_ERR" || grep -q "Connection refused" "$TMP_ERR"; then
+  ssh -o BatchMode=yes -o ConnectTimeout=8 "$HOST" 'PL="$HOME/Library/LaunchAgents/app.openclaw.maccontrol.plist"; launchctl kickstart -k gui/$(id -u)/app.openclaw.maccontrol' >/dev/null 2>&1 || true
+  sleep 1
+  set +e
+  ssh -o BatchMode=yes -o ConnectTimeout=8 "$HOST" /usr/bin/python3 /Users/ngotrung/OpenClawTools/MacControl/maccontrol-client.py "$PORT" <<<"$ARGV_JSON" >"$TMP_OUT" 2>"$TMP_ERR"
+  STATUS=$?
+  set -e
+  if [[ "$STATUS" -eq 0 ]]; then
+    cat "$TMP_OUT"
+    exit 0
+  fi
+fi
+
+cat "$TMP_OUT"
+cat "$TMP_ERR" >&2
+exit "$STATUS"

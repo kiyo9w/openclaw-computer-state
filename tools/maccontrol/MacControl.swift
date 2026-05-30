@@ -8,8 +8,42 @@ var activeArgs = CommandLine.arguments
 var responseFD: Int32? = nil
 
 struct JSON {
+    static func sanitize(_ value: Any) -> Any {
+        if let dict = value as? [String: Any] {
+            var out: [String: Any] = [:]
+            for (key, child) in dict {
+                out[key] = sanitize(child)
+            }
+            return out
+        }
+        if let array = value as? [Any] {
+            return array.map { sanitize($0) }
+        }
+        if let bool = value as? Bool {
+            return bool
+        }
+        if let double = value as? Double {
+            return double.isFinite ? double : 0
+        }
+        if let float = value as? Float {
+            return float.isFinite ? float : 0
+        }
+        if let number = value as? NSNumber {
+            let double = number.doubleValue
+            if !double.isFinite {
+                return 0
+            }
+            if floor(double) == double {
+                return Int64(double)
+            }
+            return double
+        }
+        return value
+    }
+
     static func print(_ value: [String: Any]) {
-        if let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]),
+        let safeValue = sanitize(value)
+        if let data = try? JSONSerialization.data(withJSONObject: safeValue, options: [.sortedKeys]),
            let text = String(data: data, encoding: .utf8) {
             if let fd = responseFD {
                 _ = text.withCString { write(fd, $0, strlen($0)) }
@@ -52,9 +86,13 @@ func defaultScreenshotPath() -> String {
 
 func screenshot() {
     let path = argValue("--out", default: defaultScreenshotPath())!
+    var arguments = ["-x", path]
+    if let windowId = argValue("--window-id") {
+        arguments = ["-x", "-l", windowId, path]
+    }
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-    process.arguments = ["-x", path]
+    process.arguments = arguments
     do {
         try process.run()
         process.waitUntilExit()
@@ -67,7 +105,11 @@ func screenshot() {
     guard let image = NSImage(contentsOfFile: path) else {
         fail("screen_capture_file_missing")
     }
-    JSON.print(["ok": true, "path": path, "width": image.size.width, "height": image.size.height])
+    var payload: [String: Any] = ["ok": true, "path": path, "width": image.size.width, "height": image.size.height]
+    if let windowId = argValue("--window-id") {
+        payload["windowId"] = Int(windowId) ?? 0
+    }
+    JSON.print(payload)
 }
 
 func pointFromArgs() -> CGPoint {
@@ -217,6 +259,13 @@ func hotkey() {
     let flags = flagsFromArgs(Array(combo.dropLast()))
     pressKey(key, flags: flags)
     JSON.print(["ok": true, "keys": combo.joined(separator: "+")])
+}
+
+func keyState() {
+    let key = require("--key")
+    let code = keyCode(key)
+    let pressed = CGEventSource.keyState(.combinedSessionState, key: code)
+    JSON.print(["ok": true, "key": key, "pressed": pressed])
 }
 
 func typeTextCore(_ text: String) {
@@ -871,7 +920,7 @@ func usage() -> Never {
 
     Commands:
       check [--prompt true]
-      screenshot [--out PATH]
+      screenshot [--out PATH] [--window-id ID]
       click --x X --y Y
       move --x X --y Y
       scroll --dx DX --dy DY
@@ -879,6 +928,7 @@ func usage() -> Never {
       applescript --script SOURCE
       type --text TEXT
       hotkey --keys cmd+v
+      key-state --key escape
       clipboard [--mode get|set] [--text TEXT]
       app --action list|open|focus|quit [--name NAME|--bundle-id ID]
       windows
@@ -912,6 +962,7 @@ func runCommand(_ args: [String]) {
     case "applescript": appleScript()
     case "type": typeText()
     case "hotkey": hotkey()
+    case "key-state": keyState()
     case "clipboard": clipboard()
     case "app": appControl()
     case "windows": windowsList()
