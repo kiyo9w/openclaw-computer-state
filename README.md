@@ -86,6 +86,12 @@ Both surfaces are exposed through the scripts in this repository:
 - **Bounded context output**: Windows snapshots and find results are capped by default to avoid context overflow.
 - **Semantic targeting**: prefer ids from the latest capture, queries, roles, labels, and UI tree matches before raw coordinates.
 - **Visual grounding**: `annotate-state` draws target ids onto screenshots. macOS uses Accessibility frames; Windows uses UIA snapshot coordinates from `windows-mcp`. Both return click centers and fall back to SVG when Pillow is unavailable.
+- **Window state checks**: Mac and Windows captures expose focused/top/opened window metadata. `foreground --expect` catches the common case where a modal or VPN prompt is stealing input, and `window-state --window` resolves a target title into a canonical window object before later actions.
+- **Occlusion detection**: `window-state` reports when a resolved target window is covered, which windows are above it, and an approximate covered-area ratio.
+- **Window-scoped action support**: `translate-point` and `window-screenshot` let agents work from a resolved window origin instead of guessing global desktop coordinates.
+- **Visible-target guard**: coordinate actions can pass `--require-visible` to refuse acting on a covered target window.
+- **Interrupt and approval gates**: mutable actions honor a cross-surface interrupt flag plus physical Escape polling, and high-risk raw actions return structured approval blockers.
+- **Lifecycle ledger**: mutable actions and `act` write JSONL run events and report artifacts addressable through `run-log`.
 - **State diffing**: save state snapshots and compare later captures as compact added/removed line deltas.
 - **Action repair loop**: `act` captures before/after state, verifies expected UI text, and retries within a small bound.
 - **Workflow replay**: JSON workflows replay through `act`, so every step still gets diff, verification, and retry.
@@ -150,6 +156,13 @@ scripts/computer-state healthcheck --surface win
 ```bash
 scripts/computer-state get-state --surface mac --app "ChatGPT Atlas" --copy-screenshot-default
 scripts/computer-state get-state --surface win --copy-screenshot-default --max-chars 20000
+scripts/computer-state foreground --surface win --expect '^Codex$'
+scripts/computer-state window-state --surface win --window '^Codex$' --copy-screenshot-default
+scripts/computer-state window-state --surface mac --app "ChatGPT Atlas" --window 'Pikachu'
+scripts/computer-state translate-point --surface win --window '^Codex$' --x 10 --y 20
+scripts/computer-state window-screenshot --surface mac --app "ChatGPT Atlas" --window 'Pikachu'
+scripts/computer-state interrupt --surface win check
+scripts/computer-state run-log --run-id <runId>
 ```
 
 ### 4. Find a target
