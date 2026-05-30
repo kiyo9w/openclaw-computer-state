@@ -107,7 +107,7 @@ scripts/computer-state run-log --run-id <runId>
 
 `act` returns `runId`, `startedAtMs`, `completedAtMs`, and `reportPath`. The run directory stores `events.jsonl` plus `act-report.json`, giving downstream agents a replayable lifecycle trail without dumping full state into chat.
 
-For repeatable workflows, use `computer-workflow`. This stores a small JSON recipe and replays every step through `act`, so each step still gets before/after state diff, expectation checks, and bounded retry:
+For repeatable workflows, use `computer-workflow`. This stores a small JSON recipe and supports both read-only preflight checks and mutable actions. Mutable steps replay through `act`, so each one still gets before/after state diff, expectation checks, and bounded retry:
 
 ```bash
 scripts/computer-workflow init --file /tmp/open-repo.json --name open-repo --surface win
@@ -115,6 +115,12 @@ scripts/computer-workflow add --file /tmp/open-repo.json press-key --key "CTRL+L
 scripts/computer-workflow add --file /tmp/open-repo.json type-text --text "https://github.com/kiyo9w/openclaw-computer-state" --enter --expect "openclaw-computer-state" --step-name navigate
 scripts/computer-workflow validate --file /tmp/open-repo.json
 scripts/computer-workflow replay --file /tmp/open-repo.json --report /tmp/open-repo-report.json
+```
+
+Use read-only steps such as `foreground`, `window-state`, `find`, `wait-for`, and `interrupt` to fail early before a workflow starts typing or clicking into the wrong surface:
+
+```json
+{"name": "browser foreground", "action": "foreground", "expect": "Chrome|Brave"}
 ```
 
 Workflow text fields support variables for data entry and environment-specific values:

@@ -47,7 +47,7 @@ HOST=0.0.0.0 PORT=8000 node /tmp/local-mock-api.js
 NEXT_PUBLIC_API_URL=http://<WSL_IP>:8000 pnpm exec next dev -H 127.0.0.1 -p 3010
 ```
 
-5. Use Windows browser CDP or the replayable route check:
+5. Focus the Windows browser, then use Windows browser CDP or the replayable route check. The workflow now starts with a read-only foreground assertion, so it fails before typing if another app is focused:
 
 ```bash
 scripts/computer-workflow replay \

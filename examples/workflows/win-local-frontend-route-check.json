@@ -17,14 +17,18 @@
   "operator_notes": {
     "created_from": "2026-05-29 Insider model-settings production-readiness validation",
     "preconditions": [
-      "A Windows browser window is focused.",
       "The target frontend route is reachable from Windows, not only from WSL.",
       "If the API runs in WSL, bind it on 0.0.0.0 and use the WSL IP from the Windows browser.",
-      "Use this workflow only for the browser navigation/reachability step; keep assertions in the validation harness or manual DOM/CDP checks."
+      "Use this workflow for browser focus, navigation, and route reachability; keep deep DOM/console/network assertions in the validation harness or CDP checks."
     ],
     "example": "scripts/computer-workflow replay --file examples/workflows/win-local-frontend-route-check.json --var URL=http://localhost:3010/en/admin/model-settings --var EXPECT='Admin Model Control Plane'"
   },
   "steps": [
+    {
+      "name": "verify browser is foreground",
+      "action": "foreground",
+      "expect": "Chrome|Brave"
+    },
     {
       "name": "focus browser address bar",
       "action": "press-key",
