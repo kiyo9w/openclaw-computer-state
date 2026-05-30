@@ -83,6 +83,87 @@ TOOLS: list[dict[str, Any]] = [
         ),
     },
     {
+        "name": "computer_foreground",
+        "description": "Inspect the foreground Windows app and optionally verify that a title regex/substr is focused before clicking or typing.",
+        "inputSchema": schema_object(
+            {
+                "surface": SURFACE,
+                "expect": {"type": "string", "description": "Expected foreground window title regex/substr, for example ^Codex$."},
+                **GLOBAL,
+            }
+        ),
+    },
+    {
+        "name": "computer_interrupt",
+        "description": "Check, set, or clear the cross-surface computer-use interrupt gate. Mutable actions refuse to run while interrupted.",
+        "inputSchema": schema_object(
+            {
+                "surface": SURFACE,
+                "mode": {"type": "string", "enum": ["check", "set", "clear"]},
+                "reason": {"type": "string", "default": "user_requested"},
+                **GLOBAL,
+            },
+            ["mode"],
+        ),
+    },
+    {
+        "name": "computer_run_log",
+        "description": "Read lifecycle events and artifact paths for a computer-state run id.",
+        "inputSchema": schema_object(
+            {
+                "run_id": {"type": "string", "description": "Run id returned by computer_act or provided as ledger_run."},
+            },
+            ["run_id"],
+        ),
+    },
+    {
+        "name": "computer_window_state",
+        "description": "Resolve a window title regex/substr to a canonical window object and capture target-window state metadata before acting.",
+        "inputSchema": schema_object(
+            {
+                "surface": SURFACE,
+                **MAC_TARGET,
+                "window": {"type": "string", "description": "Window title regex/substr, for example ^Codex$."},
+                "max_chars": {"type": "integer", "default": 20000, "description": "Windows snapshot text character cap; 0 means unlimited."},
+                "copy_screenshot": {"type": "string", "description": "Optional local path for screenshot copy."},
+                "copy_screenshot_default": {"type": "boolean", "default": False},
+                "include_snapshot": {"type": "boolean", "default": False},
+                **GLOBAL,
+            },
+            ["window"],
+        ),
+    },
+    {
+        "name": "computer_translate_point",
+        "description": "Translate window-relative coordinates into global screen coordinates without performing an action.",
+        "inputSchema": schema_object(
+            {
+                "surface": SURFACE,
+                **MAC_TARGET,
+                "window": {"type": "string", "description": "Window title regex/substr to use as coordinate origin."},
+                "x": {"type": "number"},
+                "y": {"type": "number"},
+                **GLOBAL,
+            },
+            ["window", "x", "y"],
+        ),
+    },
+    {
+        "name": "computer_window_screenshot",
+        "description": "Capture a screenshot scoped to a resolved Mac/Windows window and return screenshot id/origin metadata.",
+        "inputSchema": schema_object(
+            {
+                "surface": SURFACE,
+                **MAC_TARGET,
+                "window": {"type": "string", "description": "Window title regex/substr to capture."},
+                "out": {"type": "string", "description": "Optional local output PNG path."},
+                "max_chars": {"type": "integer", "default": 8000},
+                **GLOBAL,
+            },
+            ["window"],
+        ),
+    },
+    {
         "name": "computer_get_state",
         "description": "Capture the current UI state. Call this before GUI actions. Returns screenshot metadata and a semantic UI tree where available.",
         "inputSchema": schema_object(
@@ -149,6 +230,8 @@ TOOLS: list[dict[str, Any]] = [
                 "query": {"type": "string", "description": "Semantic query for target/action."},
                 "role": {"type": "string", "description": "Optional Mac AX role filter."},
                 "label": {"type": "integer", "description": "Windows numeric annotation label."},
+                "window": {"type": "string", "description": "Window title regex/substr; coordinate fields are interpreted relative to this window when set."},
+                "require_visible": {"type": "boolean", "default": False, "description": "Block window-relative actions if the target window is occluded."},
                 "x": {"type": "number"},
                 "y": {"type": "number"},
                 "x1": {"type": "number"},
@@ -208,6 +291,8 @@ TOOLS: list[dict[str, Any]] = [
                 "query": {"type": "string", "description": "Mac semantic query."},
                 "role": {"type": "string", "description": "Optional Mac AX role filter."},
                 "label": {"type": "integer", "description": "Windows numeric annotation label."},
+                "window": {"type": "string", "description": "Window title regex/substr; coordinate fields are interpreted relative to this window when set."},
+                "require_visible": {"type": "boolean", "default": False, "description": "Block window-relative clicks if the target window is occluded."},
                 "x": {"type": "number"},
                 "y": {"type": "number"},
                 "button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"},
@@ -228,6 +313,8 @@ TOOLS: list[dict[str, Any]] = [
                 "query": {"type": "string", "description": "Mac semantic query."},
                 "role": {"type": "string", "description": "Optional Mac AX role filter."},
                 "label": {"type": "integer", "description": "Windows numeric annotation label."},
+                "window": {"type": "string", "description": "Window title regex/substr; coordinate fields are interpreted relative to this window when set."},
+                "require_visible": {"type": "boolean", "default": False, "description": "Block window-relative typing if the target window is occluded."},
                 "x": {"type": "number"},
                 "y": {"type": "number"},
                 "enter": {"type": "boolean", "default": False},
@@ -248,6 +335,8 @@ TOOLS: list[dict[str, Any]] = [
                 "query": {"type": "string", "description": "Mac semantic query."},
                 "role": {"type": "string", "description": "Optional Mac AX role filter."},
                 "label": {"type": "integer", "description": "Windows numeric annotation label."},
+                "window": {"type": "string", "description": "Window title regex/substr; coordinate fields are interpreted relative to this window when set."},
+                "require_visible": {"type": "boolean", "default": False, "description": "Block window-relative typing if the target window is occluded."},
                 "x": {"type": "number"},
                 "y": {"type": "number"},
                 "clear": {"type": "boolean", "default": False},
@@ -313,6 +402,8 @@ TOOLS: list[dict[str, Any]] = [
                 "surface": SURFACE,
                 "text": {"type": "string"},
                 "label": {"type": "integer", "description": "Windows numeric annotation label."},
+                "window": {"type": "string", "description": "Window title regex/substr; coordinate fields are interpreted relative to this window when set."},
+                "require_visible": {"type": "boolean", "default": False, "description": "Block window-relative typing if the target window is occluded."},
                 "x": {"type": "number"},
                 "y": {"type": "number"},
                 "clear": {"type": "boolean", "default": False},
@@ -342,6 +433,8 @@ TOOLS: list[dict[str, Any]] = [
                 "surface": SURFACE,
                 "dx": {"type": "integer", "default": 0},
                 "dy": {"type": "integer", "default": 0},
+                "window": {"type": "string", "description": "Window title regex/substr; x/y are interpreted relative to this window when set."},
+                "require_visible": {"type": "boolean", "default": False, "description": "Block window-relative scrolling if the target window is occluded."},
                 "x": {"type": "number", "description": "Optional Windows cursor x position before scrolling."},
                 "y": {"type": "number", "description": "Optional Windows cursor y position before scrolling."},
                 **GLOBAL,
@@ -358,6 +451,8 @@ TOOLS: list[dict[str, Any]] = [
                 "y1": {"type": "number"},
                 "x2": {"type": "number"},
                 "y2": {"type": "number"},
+                "window": {"type": "string", "description": "Window title regex/substr; drag coordinates are interpreted relative to this window when set."},
+                "require_visible": {"type": "boolean", "default": False, "description": "Block window-relative dragging if the target window is occluded."},
                 **GLOBAL,
             },
             ["x1", "y1", "x2", "y2"],
@@ -447,6 +542,36 @@ def run_computer_state(command: str, args: dict[str, Any]) -> dict[str, Any]:
             cmd.extend(["--window-width", str(args["window_width"])])
         if args.get("window_height") is not None:
             cmd.extend(["--window-height", str(args["window_height"])])
+    elif command == "foreground":
+        if args.get("expect"):
+            cmd.extend(["--expect", str(args["expect"])])
+    elif command == "interrupt":
+        cmd.append(str(args["mode"]))
+        if args.get("reason"):
+            cmd.extend(["--reason", str(args["reason"])])
+    elif command == "run-log":
+        cmd.extend(["--run-id", str(args["run_id"])])
+    elif command == "window-state":
+        add_mac_target(cmd, args)
+        cmd.extend(["--window", str(args["window"])])
+        if args.get("max_chars") is not None:
+            cmd.extend(["--max-chars", str(args["max_chars"])])
+        if args.get("copy_screenshot"):
+            cmd.extend(["--copy-screenshot", str(args["copy_screenshot"])])
+        if args.get("copy_screenshot_default"):
+            cmd.append("--copy-screenshot-default")
+        if args.get("include_snapshot"):
+            cmd.append("--include-snapshot")
+    elif command == "translate-point":
+        add_mac_target(cmd, args)
+        cmd.extend(["--window", str(args["window"]), "--x", str(args["x"]), "--y", str(args["y"])])
+    elif command == "window-screenshot":
+        add_mac_target(cmd, args)
+        cmd.extend(["--window", str(args["window"])])
+        if args.get("out"):
+            cmd.extend(["--out", str(args["out"])])
+        if args.get("max_chars") is not None:
+            cmd.extend(["--max-chars", str(args["max_chars"])])
     elif command == "get-state":
         add_mac_target(cmd, args)
         if args.get("max_depth") is not None:
@@ -493,6 +618,7 @@ def run_computer_state(command: str, args: dict[str, Any]) -> dict[str, Any]:
             ("query", "--query"),
             ("role", "--role"),
             ("label", "--label"),
+            ("window", "--window"),
             ("x", "--x"),
             ("y", "--y"),
             ("x1", "--x1"),
@@ -522,6 +648,8 @@ def run_computer_state(command: str, args: dict[str, Any]) -> dict[str, Any]:
             cmd.append("--enter")
         if args.get("include_states"):
             cmd.append("--include-states")
+        if args.get("require_visible"):
+            cmd.append("--require-visible")
     elif command == "click":
         add_mac_target(cmd, args)
         if args.get("id") is not None:
@@ -532,6 +660,10 @@ def run_computer_state(command: str, args: dict[str, Any]) -> dict[str, Any]:
             cmd.extend(["--role", str(args["role"])])
         if args.get("label"):
             cmd.extend(["--label", str(args["label"])])
+        if args.get("window"):
+            cmd.extend(["--window", str(args["window"])])
+        if args.get("require_visible"):
+            cmd.append("--require-visible")
         if args.get("x") is not None:
             cmd.extend(["--x", str(args["x"])])
         if args.get("y") is not None:
@@ -551,6 +683,10 @@ def run_computer_state(command: str, args: dict[str, Any]) -> dict[str, Any]:
             cmd.extend(["--role", str(args["role"])])
         if args.get("label") is not None:
             cmd.extend(["--label", str(args["label"])])
+        if args.get("window"):
+            cmd.extend(["--window", str(args["window"])])
+        if args.get("require_visible"):
+            cmd.append("--require-visible")
         if args.get("x") is not None:
             cmd.extend(["--x", str(args["x"])])
         if args.get("y") is not None:
@@ -569,6 +705,10 @@ def run_computer_state(command: str, args: dict[str, Any]) -> dict[str, Any]:
             cmd.extend(["--role", str(args["role"])])
         if args.get("label"):
             cmd.extend(["--label", str(args["label"])])
+        if args.get("window"):
+            cmd.extend(["--window", str(args["window"])])
+        if args.get("require_visible"):
+            cmd.append("--require-visible")
         if args.get("x") is not None:
             cmd.extend(["--x", str(args["x"])])
         if args.get("y") is not None:
@@ -616,8 +756,16 @@ def run_computer_state(command: str, args: dict[str, Any]) -> dict[str, Any]:
             cmd.extend(["--x", str(args["x"])])
         if args.get("y") is not None:
             cmd.extend(["--y", str(args["y"])])
+        if args.get("window"):
+            cmd.extend(["--window", str(args["window"])])
+        if args.get("require_visible"):
+            cmd.append("--require-visible")
     elif command == "drag":
         cmd.extend(["--x1", str(args["x1"]), "--y1", str(args["y1"]), "--x2", str(args["x2"]), "--y2", str(args["y2"])])
+        if args.get("window"):
+            cmd.extend(["--window", str(args["window"])])
+        if args.get("require_visible"):
+            cmd.append("--require-visible")
     elif command == "wait-for":
         add_mac_target(cmd, args)
         cmd.extend(["--query", str(args["query"])])
@@ -684,6 +832,12 @@ def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         "computer_healthcheck": "healthcheck",
         "computer_list_apps": "list-apps",
         "computer_app": "app",
+        "computer_foreground": "foreground",
+        "computer_interrupt": "interrupt",
+        "computer_run_log": "run-log",
+        "computer_window_state": "window-state",
+        "computer_translate_point": "translate-point",
+        "computer_window_screenshot": "window-screenshot",
         "computer_get_state": "get-state",
         "computer_annotate_state": "annotate-state",
         "computer_find": "find",

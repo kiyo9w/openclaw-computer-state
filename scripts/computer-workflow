@@ -128,6 +128,7 @@ def step_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "query",
         "role",
         "label",
+        "window",
         "x",
         "y",
         "x1",
@@ -141,6 +142,7 @@ def step_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "key",
         "text",
         "ax_action",
+        "require_visible",
         "clear",
         "enter",
     ):
@@ -198,6 +200,7 @@ def build_act_command(workflow: dict[str, Any], step: dict[str, Any], variables:
         ("query", "--query"),
         ("role", "--role"),
         ("label", "--label"),
+        ("window", "--window"),
         ("x", "--x"),
         ("y", "--y"),
         ("x1", "--x1"),
@@ -218,6 +221,8 @@ def build_act_command(workflow: dict[str, Any], step: dict[str, Any], variables:
         cmd.append("--clear")
     if args.get("enter"):
         cmd.append("--enter")
+    if args.get("require_visible"):
+        cmd.append("--require-visible")
     for key, flag in (
         ("expect", "--expect"),
         ("retries", "--retries"),
@@ -311,6 +316,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--query")
     p.add_argument("--role")
     p.add_argument("--label")
+    p.add_argument("--window")
     p.add_argument("--x", type=float)
     p.add_argument("--y", type=float)
     p.add_argument("--x1", type=float)
@@ -324,6 +330,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--key")
     p.add_argument("--text")
     p.add_argument("--ax-action", dest="ax_action")
+    p.add_argument("--require-visible", action="store_true")
     p.add_argument("--clear", action="store_true")
     p.add_argument("--enter", action="store_true")
     p.add_argument("--expect")
