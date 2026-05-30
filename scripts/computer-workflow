@@ -12,6 +12,9 @@ ROOT = Path(__file__).resolve().parents[1]
 COMPUTER_STATE = ROOT / "scripts" / "computer-state"
 RUN_DIR = ROOT / ".control-runs" / "workflows"
 VAR_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+MUTATING_ACTIONS = {"click", "set-value", "type-into", "type-text", "press-key", "scroll", "drag", "perform-action"}
+READ_ONLY_ACTIONS = {"foreground", "window-state", "translate-point", "window-screenshot", "get-state", "find", "wait-for", "interrupt"}
+SUPPORTED_ACTIONS = MUTATING_ACTIONS | READ_ONLY_ACTIONS
 
 
 class CliError(Exception):
@@ -93,7 +96,7 @@ def validate_workflow(payload: dict[str, Any]) -> list[str]:
         if not isinstance(step, dict):
             errors.append(f"step {i} must be an object")
             continue
-        if step.get("action") not in {"click", "set-value", "type-into", "type-text", "press-key", "scroll", "drag", "perform-action"}:
+        if step.get("action") not in SUPPORTED_ACTIONS:
             errors.append(f"step {i} has unsupported action: {step.get('action')}")
         if "args" in step and not isinstance(step["args"], dict):
             errors.append(f"step {i} args must be an object")
@@ -145,6 +148,15 @@ def step_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "require_visible",
         "clear",
         "enter",
+        "mode",
+        "reason",
+        "out",
+        "limit",
+        "timeout_ms",
+        "interval_ms",
+        "copy_screenshot",
+        "copy_screenshot_default",
+        "include_snapshot",
     ):
         value = getattr(args, key, None)
         if value is not None and value is not False:
@@ -154,7 +166,7 @@ def step_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "action": args.action,
         "args": step_args,
     }
-    for key in ("expect", "retries", "settle_ms", "diff_limit", "max_chars"):
+    for key in ("expect", "retries", "settle_ms", "diff_limit", "max_chars", "max_depth", "max_nodes"):
         value = getattr(args, key, None)
         if value is not None:
             step[key] = value
@@ -243,6 +255,68 @@ def build_act_command(workflow: dict[str, Any], step: dict[str, Any], variables:
     return cmd
 
 
+def add_common_target_flags(cmd: list[str], args: dict[str, Any]) -> None:
+    for key, flag in (
+        ("id", "--id"),
+        ("query", "--query"),
+        ("role", "--role"),
+        ("label", "--label"),
+        ("window", "--window"),
+        ("x", "--x"),
+        ("y", "--y"),
+        ("out", "--out"),
+        ("limit", "--limit"),
+        ("timeout_ms", "--timeout-ms"),
+        ("interval_ms", "--interval-ms"),
+        ("copy_screenshot", "--copy-screenshot"),
+    ):
+        if args.get(key) is not None:
+            cmd.extend([flag, str(args[key])])
+    if args.get("copy_screenshot_default"):
+        cmd.append("--copy-screenshot-default")
+    if args.get("include_snapshot"):
+        cmd.append("--include-snapshot")
+
+
+def build_read_only_command(workflow: dict[str, Any], step: dict[str, Any], variables: dict[str, str]) -> list[str]:
+    defaults = workflow.get("defaults") if isinstance(workflow.get("defaults"), dict) else {}
+    rendered = render_value(step, variables)
+    action = str(rendered["action"])
+    args = rendered.get("args") if isinstance(rendered.get("args"), dict) else {}
+    cmd = [str(COMPUTER_STATE), action]
+    if action != "run-log":
+        cmd.extend(["--surface", str(workflow["surface"])])
+    if action == "interrupt":
+        cmd.append(str(args.get("mode") or "check"))
+        if args.get("reason") is not None:
+            cmd.extend(["--reason", str(args["reason"])])
+    else:
+        add_common_target_flags(cmd, args)
+    if action == "foreground":
+        value = rendered.get("expect", args.get("expect"))
+        if value is not None:
+            cmd.extend(["--expect", str(value)])
+    for key, flag in (
+        ("max_chars", "--max-chars"),
+        ("max_depth", "--max-depth"),
+        ("max_nodes", "--max-nodes"),
+        ("diff_limit", "--diff-limit"),
+    ):
+        value = rendered.get(key, defaults.get(key))
+        if value is not None and action in {"window-state", "window-screenshot", "get-state"}:
+            cmd.extend([flag, str(value)])
+    return cmd
+
+
+def build_step_command(workflow: dict[str, Any], step: dict[str, Any], variables: dict[str, str]) -> tuple[str, list[str]]:
+    action = step.get("action")
+    if action in MUTATING_ACTIONS:
+        return "act", build_act_command(workflow, step, variables)
+    if action in READ_ONLY_ACTIONS:
+        return "check", build_read_only_command(workflow, step, variables)
+    raise CliError(f"unsupported action: {action}")
+
+
 def command_replay(args: argparse.Namespace) -> int:
     workflow = read_json(args.file)
     errors = validate_workflow(workflow)
@@ -269,11 +343,12 @@ def command_replay(args: argparse.Namespace) -> int:
     }
     for index, step in selected:
         started = time.time()
-        cmd = build_act_command(workflow, step, variables)
+        kind, cmd = build_step_command(workflow, step, variables)
         row: dict[str, Any] = {
             "index": index,
             "name": step.get("name") or step.get("action"),
             "action": step.get("action"),
+            "kind": kind,
             "command": cmd,
             "optional": bool(step.get("optional")),
         }
@@ -311,7 +386,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--file", required=True)
     p.add_argument("--step-name")
     p.add_argument("--optional", action="store_true")
-    p.add_argument("action", choices=["click", "set-value", "type-into", "type-text", "press-key", "scroll", "drag", "perform-action"])
+    p.add_argument("action", choices=sorted(SUPPORTED_ACTIONS))
     p.add_argument("--id", type=int)
     p.add_argument("--query")
     p.add_argument("--role")
@@ -333,11 +408,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--require-visible", action="store_true")
     p.add_argument("--clear", action="store_true")
     p.add_argument("--enter", action="store_true")
+    p.add_argument("--mode", choices=["check", "set", "clear"])
+    p.add_argument("--reason")
+    p.add_argument("--out")
+    p.add_argument("--limit", type=int)
+    p.add_argument("--timeout-ms", type=int)
+    p.add_argument("--interval-ms", type=int)
+    p.add_argument("--copy-screenshot")
+    p.add_argument("--copy-screenshot-default", action="store_true")
+    p.add_argument("--include-snapshot", action="store_true")
     p.add_argument("--expect")
     p.add_argument("--retries", type=int)
     p.add_argument("--settle-ms", type=int)
     p.add_argument("--diff-limit", type=int)
     p.add_argument("--max-chars", type=int)
+    p.add_argument("--max-depth", type=int)
+    p.add_argument("--max-nodes", type=int)
     p.set_defaults(func=command_add)
 
     p = sub.add_parser("validate")
